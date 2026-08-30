@@ -11,6 +11,7 @@
 #include "float_number_widget.h"
 #include "flow_layout.h"
 #include "glb_file.h"
+#include "glb_forever.h"
 #include "horizontal_line_widget.h"
 #include "image_forever.h"
 #include "log_browser.h"
@@ -19,15 +20,18 @@
 #include "preview_overlay_controller.h"
 #include "skeleton_graphics_widget.h"
 #include "spinnable_toolbar_icon.h"
+#include "steps_replay_window.h"
 #include "theme.h"
 #include "turnaround_image_editor_dialog.h"
 #include "turnaround_overlay_widget.h"
 #include "uv_map_generator.h"
 #include "version.h"
 #include "world_widget.h"
+#include <QAbstractSpinBox>
 #include <QApplication>
 #include <QChildEvent>
 #include <QDesktopServices>
+#include <QDialog>
 #include <QDir>
 #include <QDockWidget>
 #include <QFile>
@@ -37,7 +41,9 @@
 #include <QGraphicsOpacityEffect>
 #include <QGridLayout>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
@@ -48,7 +54,9 @@
 #include <QScrollArea>
 #include <QTabBar>
 #include <QTabWidget>
+#include <QTableWidget>
 #include <QTextBrowser>
+#include <QTextEdit>
 #include <QTimer>
 #include <QToolBar>
 #include <QToolButton>
@@ -476,17 +484,81 @@ DocumentWindow::DocumentWindow()
         m_exportAsFbxAction->setEnabled(m_canvasGraphicsWidget->hasItems() && m_document->isExportReady());
     });
 
+    m_editMenu = menuBar()->addMenu(tr("&Edit"));
+
+    m_undoAction = new QAction(tr("&Undo"), this);
+    m_undoAction->setShortcut(QKeySequence::Undo);
+    m_undoAction->setShortcutContext(Qt::WidgetShortcut); // shortcut handled by QShortcut below
+    connect(m_undoAction, &QAction::triggered, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutUndo);
+    m_editMenu->addAction(m_undoAction);
+
+    m_redoAction = new QAction(tr("&Redo"), this);
+    m_redoAction->setShortcuts({ QKeySequence::Redo, QKeySequence(Qt::CTRL | Qt::Key_Y) });
+    m_redoAction->setShortcutContext(Qt::WidgetShortcut); // shortcut handled by QShortcut below
+    connect(m_redoAction, &QAction::triggered, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutRedo);
+    m_editMenu->addAction(m_redoAction);
+
+    m_editMenu->addSeparator();
+
+    m_cutAction = new QAction(tr("Cu&t"), this);
+    m_cutAction->setShortcut(QKeySequence::Cut);
+    m_cutAction->setShortcutContext(Qt::WidgetShortcut); // shortcut handled by QShortcut below
+    connect(m_cutAction, &QAction::triggered, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutCut);
+    m_editMenu->addAction(m_cutAction);
+
+    m_copyAction = new QAction(tr("&Copy"), this);
+    m_copyAction->setShortcut(QKeySequence::Copy);
+    m_copyAction->setShortcutContext(Qt::WidgetShortcut); // shortcut handled by QShortcut below
+    connect(m_copyAction, &QAction::triggered, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutCopy);
+    m_editMenu->addAction(m_copyAction);
+
+    m_pasteAction = new QAction(tr("&Paste"), this);
+    m_pasteAction->setShortcut(QKeySequence::Paste);
+    m_pasteAction->setShortcutContext(Qt::WidgetShortcut); // shortcut handled by QShortcut below
+    connect(m_pasteAction, &QAction::triggered, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutPaste);
+    m_editMenu->addAction(m_pasteAction);
+
+    m_deleteAction = new QAction(tr("&Delete"), this);
+    m_deleteAction->setShortcut(QKeySequence::Delete);
+    m_deleteAction->setShortcutContext(Qt::WidgetShortcut); // shortcut handled by QShortcut below
+    connect(m_deleteAction, &QAction::triggered, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutDelete);
+    m_editMenu->addAction(m_deleteAction);
+
+    m_editMenu->addSeparator();
+
+    m_selectAllAction = new QAction(tr("Select &All"), this);
+    m_selectAllAction->setShortcut(QKeySequence::SelectAll);
+    m_selectAllAction->setShortcutContext(Qt::WidgetShortcut); // shortcut handled by QShortcut below
+    connect(m_selectAllAction, &QAction::triggered, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutSelectAll);
+    m_editMenu->addAction(m_selectAllAction);
+
+    // The QAction shortcuts above are set to WidgetShortcut so the action's
+    // enabled state does not gate the key binding.  Always-active QShortcut
+    // objects are registered in initializeShortcuts() to own the actual
+    // keyboard handling for the Edit menu commands.
+
+    connect(m_editMenu, &QMenu::aboutToShow, [=]() {
+        m_undoAction->setEnabled(m_document->undoable());
+        m_redoAction->setEnabled(m_document->redoable());
+        m_cutAction->setEnabled(m_canvasGraphicsWidget->hasSelection());
+        m_copyAction->setEnabled(m_canvasGraphicsWidget->hasNodeSelection());
+        m_pasteAction->setEnabled(m_document->hasPastableNodesInClipboard());
+        m_deleteAction->setEnabled(m_canvasGraphicsWidget->hasSelection());
+        m_selectAllAction->setEnabled(m_canvasGraphicsWidget->hasItems());
+    });
+
     m_viewMenu = menuBar()->addMenu(tr("&View"));
 
     m_toggleWireframeAction = new QAction(tr("Toggle Wireframe"), this);
+    m_toggleWireframeAction->setShortcut(Qt::Key_W);
     connect(m_toggleWireframeAction, &QAction::triggered, [=]() {
         m_modelRenderWidget->toggleWireframe();
         m_boneManageWidget->setWireframeVisible(m_modelRenderWidget->isWireframeVisible());
-        m_animationManageWidget->setWireframeVisible(m_modelRenderWidget->isWireframeVisible());
     });
     m_viewMenu->addAction(m_toggleWireframeAction);
 
     m_toggleRotationAction = new QAction(tr("Toggle Rotation"), this);
+    m_toggleRotationAction->setShortcut(Qt::Key_R);
     connect(m_toggleRotationAction, &QAction::triggered, [=]() {
         m_modelRenderWidget->toggleRotation();
     });
@@ -540,6 +612,17 @@ DocumentWindow::DocumentWindow()
     connect(m_showDebugDialogAction, &QAction::triggered, g_logBrowser, &LogBrowser::showDialog);
     m_windowMenu->addAction(m_showDebugDialogAction);
 
+    m_windowMenu->addSeparator();
+
+    m_workflowReplayAction = new QAction(tr("Replay Steps"), this);
+    m_workflowReplayAction->setEnabled(false);
+    connect(m_workflowReplayAction, &QAction::triggered, this, [=]() {
+        StepsReplayWindow* demoFlow = new StepsReplayWindow(m_document, this);
+        demoFlow->setAttribute(Qt::WA_DeleteOnClose);
+        demoFlow->show();
+    });
+    m_windowMenu->addAction(m_workflowReplayAction);
+
     m_helpMenu = menuBar()->addMenu(tr("&Help"));
 
     m_gotoHomepageAction = new QAction(tr("Dust3D Homepage"), this);
@@ -574,12 +657,20 @@ DocumentWindow::DocumentWindow()
     connect(m_seeAcknowlegementsAction, &QAction::triggered, this, &DocumentWindow::seeAcknowlegements);
     m_helpMenu->addAction(m_seeAcknowlegementsAction);
 
+    m_helpMenu->addSeparator();
+
+    m_keyboardShortcutsAction = new QAction(tr("Keyboard Shortcuts..."), this);
+    connect(m_keyboardShortcutsAction, &QAction::triggered, this, &DocumentWindow::showKeyboardShortcuts);
+    m_helpMenu->addAction(m_keyboardShortcutsAction);
+
     connect(containerWidget, &GraphicsContainerWidget::containerSizeChanged,
         canvasGraphicsWidget, &SkeletonGraphicsWidget::canvasResized);
 
     connect(m_document, &Document::turnaroundChanged,
         canvasGraphicsWidget, &SkeletonGraphicsWidget::turnaroundChanged);
     connect(m_document, &Document::turnaroundChanged,
+        this, &DocumentWindow::updateTurnaroundShortcutsOverlay);
+    connect(m_document, &Document::skeletonChanged,
         this, &DocumentWindow::updateTurnaroundShortcutsOverlay);
     updateTurnaroundShortcutsOverlay();
 
@@ -633,14 +724,13 @@ DocumentWindow::DocumentWindow()
     connect(canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutToggleWireframe, [=]() {
         m_modelRenderWidget->toggleWireframe();
         m_boneManageWidget->setWireframeVisible(m_modelRenderWidget->isWireframeVisible());
-        m_animationManageWidget->setWireframeVisible(m_modelRenderWidget->isWireframeVisible());
     });
 
     //connect(canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutToggleFlatShading, [=]() {
     //    Preferences::instance().setFlatShading(!Preferences::instance().flatShading());
     //});
 
-    //connect(canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutToggleRotation, this, &DocumentWindow::toggleRotation);
+    connect(canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutToggleRotation, this, &DocumentWindow::toggleRotation);
 
     connect(canvasGraphicsWidget, &SkeletonGraphicsWidget::zoomRenderedModelBy, m_modelRenderWidget, &ModelWidget::zoom);
 
@@ -695,6 +785,7 @@ DocumentWindow::DocumentWindow()
     connect(canvasGraphicsWidget, &SkeletonGraphicsWidget::open, this, &DocumentWindow::open);
 
     connect(canvasGraphicsWidget, &SkeletonGraphicsWidget::showOrHideAllComponents, m_document, &Document::showOrHideAllComponents);
+    connect(canvasGraphicsWidget, &SkeletonGraphicsWidget::showAllOrHideOtherComponents, m_document, &Document::showAllOrHideOtherComponents);
 
     connect(m_document, &Document::nodeAdded, canvasGraphicsWidget, &SkeletonGraphicsWidget::nodeAdded);
     connect(m_document, &Document::nodeRemoved, canvasGraphicsWidget, &SkeletonGraphicsWidget::nodeRemoved);
@@ -721,6 +812,7 @@ DocumentWindow::DocumentWindow()
     connect(m_partManageWidget, &PartManageWidget::selectPartOnCanvas, canvasGraphicsWidget, &SkeletonGraphicsWidget::addPartToSelection);
 
     connect(canvasGraphicsWidget, &SkeletonGraphicsWidget::partComponentChecked, m_partManageWidget, &PartManageWidget::selectComponentByPartId);
+    connect(canvasGraphicsWidget, &SkeletonGraphicsWidget::showComponentPropertyRequested, m_partManageWidget, &PartManageWidget::showComponentPropertyForParts);
 
     connect(m_document, &Document::skeletonChanged, m_document, &Document::generateMesh);
     connect(m_document, &Document::textureChanged, m_document, &Document::generateTexture);
@@ -755,6 +847,10 @@ DocumentWindow::DocumentWindow()
 
     initializeShortcuts();
 
+    makeDockWidgetsNonFocusable();
+
+    qApp->installEventFilter(this);
+
     connect(this, &DocumentWindow::initialized, m_document, &Document::uiReady);
 
     QTimer* timer = new QTimer(this);
@@ -786,8 +882,12 @@ void DocumentWindow::updateTurnaroundShortcutsOverlay()
         return;
 
     const bool hasLoadedTurnaround = !m_document->turnaround.isNull();
-    const bool isMissingTurnaround = !hasLoadedTurnaround;
+    const bool hasModelContent = !m_document->partMap.empty();
+    const bool isMissingTurnaround = !hasLoadedTurnaround && !hasModelContent;
     m_turnaroundShortcutsOverlay->setVisible(isMissingTurnaround);
+
+    if (m_workflowReplayAction)
+        m_workflowReplayAction->setEnabled(hasLoadedTurnaround || hasModelContent);
 
     if (m_turnaroundShortcutsOverlay) {
         if (isMissingTurnaround) {
@@ -971,6 +1071,84 @@ void DocumentWindow::seeAcknowlegements()
     DocumentWindow::showAcknowlegements();
 }
 
+void DocumentWindow::showKeyboardShortcuts()
+{
+    QDialog* dialog = new QDialog(this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setWindowTitle(tr("Keyboard Shortcuts"));
+    dialog->resize(520, 560);
+
+    auto* table = new QTableWidget(dialog);
+    table->setColumnCount(2);
+    table->setHorizontalHeaderLabels({ tr("Shortcut"), tr("Action") });
+    table->horizontalHeader()->setStretchLastSection(true);
+    table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    table->verticalHeader()->setVisible(false);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setAlternatingRowColors(true);
+
+    struct Entry {
+        QString shortcut;
+        QString action;
+    };
+    const QVector<Entry> entries = {
+        // File
+        { tr("Ctrl+N"), tr("New Window") },
+        { tr("Ctrl+O"), tr("Open...") },
+        { tr("Ctrl+S"), tr("Save") },
+        // Edit
+        { tr("Ctrl+Z"), tr("Undo") },
+        { tr("Ctrl+Shift+Z"), tr("Redo") },
+        { tr("Ctrl+X"), tr("Cut") },
+        { tr("Ctrl+C"), tr("Copy") },
+        { tr("Ctrl+V"), tr("Paste") },
+        { tr("Delete / Backspace"), tr("Delete selected") },
+        { tr("Ctrl+A"), tr("Select All") },
+        // Tools
+        { tr("A"), tr("Add mode") },
+        { tr("S"), tr("Select mode") },
+        { tr("Escape"), tr("Cancel / Deselect") },
+        { tr("Space"), tr("Show component property") },
+        // View
+        { tr("W"), tr("Toggle Wireframe") },
+        { tr("R"), tr("Toggle Rotation") },
+        // Axis lock
+        { tr("X"), tr("Lock X axis") },
+        { tr("Y"), tr("Lock Y axis") },
+        { tr("Z"), tr("Lock Z axis") },
+        // Part toggles
+        { tr("H"), tr("Show / Hide selected part") },
+        { tr("Shift+H"), tr("Isolate part / show all (toggle)") },
+        { tr("J"), tr("Enable / Disable selected part") },
+        { tr("L"), tr("Lock / Unlock selected part") },
+        { tr("M"), tr("Toggle X-Mirror") },
+        { tr("B"), tr("Toggle Subdivide") },
+        { tr("U"), tr("Toggle Round End") },
+        { tr("C"), tr("Toggle Chamfer") },
+        { tr("E"), tr("Switch profile on selected") },
+        { tr("F"), tr("Check part component") },
+        // Canvas manipulation
+        { tr("= / -"), tr("Zoom selected +/-1") },
+        { tr("Alt+= / Alt+-"), tr("Zoom rendered model +/-10") },
+        { tr(", / ."), tr("Rotate selected +/-1 deg") },
+        { tr("[ / ]"), tr("Scale selected +/-1") },
+        { tr("Arrow keys"), tr("Move selected") },
+    };
+
+    table->setRowCount(entries.size());
+    for (int i = 0; i < entries.size(); ++i) {
+        table->setItem(i, 0, new QTableWidgetItem(entries[i].shortcut));
+        table->setItem(i, 1, new QTableWidgetItem(entries[i].action));
+    }
+
+    auto* layout = new QVBoxLayout(dialog);
+    layout->addWidget(table);
+    dialog->setLayout(layout);
+    dialog->exec();
+}
+
 void DocumentWindow::seeContributors()
 {
     DocumentWindow::showContributors();
@@ -983,10 +1161,55 @@ void DocumentWindow::seeSupporters()
 
 DocumentWindow::~DocumentWindow()
 {
+    qApp->removeEventFilter(this);
     emit uninialized();
     g_documentWindows.erase(this);
     delete m_document;
     m_document = nullptr;
+}
+
+void DocumentWindow::makeDockWidgetsNonFocusable()
+{
+    // Dock panel widgets are mouse-driven UI; they must not steal keyboard focus
+    // from the canvas, otherwise window-level shortcuts (QShortcut with
+    // Qt::WindowShortcut context) are blocked by ShortcutOverride events that
+    // QAbstractItemView and similar widgets claim for themselves.
+    const auto docks = findChildren<QDockWidget*>();
+    for (auto* dock : docks) {
+        for (auto* w : dock->findChildren<QWidget*>()) {
+            if (!qobject_cast<QLineEdit*>(w)
+                && !qobject_cast<QTextEdit*>(w)
+                && !qobject_cast<QAbstractSpinBox*>(w)) {
+                w->setFocusPolicy(Qt::NoFocus);
+            }
+        }
+    }
+}
+
+bool DocumentWindow::eventFilter(QObject* watched, QEvent* event)
+{
+    // A single application-level filter: when a mouse press lands on a
+    // Qt::NoFocus child of this window (i.e. a dock panel widget), pull
+    // keyboard focus back to the canvas.  This handles the case where a
+    // QLineEdit in one dock already held focus — Qt::NoFocus silently keeps
+    // that focus on the line edit, so no focusChanged signal fires and the
+    // line edit's ShortcutOverride would otherwise continue to block shortcuts.
+    if (event->type() == QEvent::MouseButtonPress) {
+        auto* w = qobject_cast<QWidget*>(watched);
+        if (w && w->focusPolicy() == Qt::NoFocus && isAncestorOf(w))
+            m_canvasGraphicsWidget->setFocus();
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
+void DocumentWindow::changeEvent(QEvent* event)
+{
+    QMainWindow::changeEvent(event);
+    if (event->type() == QEvent::ActivationChange && isActiveWindow()) {
+        QWidget* focusedWidget = QApplication::focusWidget();
+        if (nullptr == focusedWidget || !isAncestorOf(focusedWidget))
+            m_canvasGraphicsWidget->setFocus();
+    }
 }
 
 void DocumentWindow::showEvent(QShowEvent* event)
@@ -1116,6 +1339,10 @@ void DocumentWindow::saveTo(const QString& saveAsFilename)
             &snapshot,
             (!m_document->turnaround.isNull() && m_document->turnaroundPngByteArray.size() > 0) ? &m_document->turnaroundPngByteArray : nullptr)) {
         setCurrentFilename(filename);
+        Preferences::instance().setCurrentFile(filename);
+        for (auto& it : g_documentWindows) {
+            it.first->updateRecentFileActions();
+        }
     }
     QApplication::restoreOverrideCursor();
 }
@@ -1141,6 +1368,16 @@ void DocumentWindow::openPathDataAs(const QString& path, const QByteArray& fileD
                     QImage image = QImage::fromData(data.data(), (int)data.size(), "PNG");
                     (void)ImageForever::add(&image, imageId);
                 }
+            } else if (dust3d::String::startsWith(item.name, "models/")) {
+                std::string filename = dust3d::String::split(item.name, '/')[1];
+                std::string glbIdString = dust3d::String::split(filename, '.')[0];
+                dust3d::Uuid glbId = dust3d::Uuid(glbIdString);
+                if (!glbId.isNull()) {
+                    std::vector<std::uint8_t> data;
+                    ds3Reader.loadItem(item.name, &data);
+                    QByteArray glbData((const char*)data.data(), (int)data.size());
+                    (void)GlbForever::add(&glbData, glbId);
+                }
             }
         }
     }
@@ -1148,11 +1385,16 @@ void DocumentWindow::openPathDataAs(const QString& path, const QByteArray& fileD
     for (int i = 0; i < (int)ds3Reader.items().size(); ++i) {
         const dust3d::Ds3ReaderItem& item = ds3Reader.items()[i];
         if (item.type == "model") {
+            static constexpr size_t maxXmlSize = 256 * 1024 * 1024; // 256 MB
             std::vector<std::uint8_t> data;
             ds3Reader.loadItem(item.name, &data);
+            if (data.size() > maxXmlSize) {
+                qWarning() << "Skipping oversized model XML chunk:" << data.size() << "bytes (limit" << maxXmlSize << ")";
+                continue;
+            }
             data.push_back('\0');
             dust3d::Snapshot snapshot;
-            loadSnapshotFromXmlString(&snapshot, (char*)data.data());
+            loadSnapshotFromXmlString(&snapshot, reinterpret_cast<char*>(data.data()));
             unifySnapshotEdgeLinkDirection(snapshot);
             m_document->fromSnapshot(snapshot);
             m_document->saveSnapshot();
@@ -1160,7 +1402,9 @@ void DocumentWindow::openPathDataAs(const QString& path, const QByteArray& fileD
             if (item.name == "canvas.png") {
                 std::vector<std::uint8_t> data;
                 ds3Reader.loadItem(item.name, &data);
-                m_document->updateTurnaround(QImage::fromData(data.data(), (int)data.size(), "PNG"));
+                QImage canvasImage = QImage::fromData(data.data(), (int)data.size(), "PNG");
+                if (!canvasImage.isNull())
+                    m_document->updateTurnaround(canvasImage);
             }
         }
     }
@@ -1439,11 +1683,11 @@ void DocumentWindow::exportFbxToFilename(const QString& filename)
         QApplication::setOverrideCursor(Qt::WaitCursor);
         dust3d::Object uvObject = m_document->currentUvMappedObject();
         FbxFileWriter fbxFileWriter(uvObject, filename,
-            m_document->textureImage,
-            m_document->textureNormalImage,
-            m_document->textureMetalnessImage,
-            m_document->textureRoughnessImage,
-            m_document->textureAmbientOcclusionImage);
+            m_document->textureImage.get(),
+            m_document->textureNormalImage.get(),
+            m_document->textureMetalnessImage.get(),
+            m_document->textureRoughnessImage.get(),
+            m_document->textureAmbientOcclusionImage.get());
         fbxFileWriter.save();
         QApplication::restoreOverrideCursor();
         return;
@@ -1478,11 +1722,11 @@ void DocumentWindow::exportFbxToFilename(const QString& filename)
         dust3d::Object rigWithUv = *rigObject;
         rigWithUv.copyUvFrom(uvObject);
         FbxFileWriter fbxFileWriter(rigWithUv, filename,
-            m_document->textureImage,
-            m_document->textureNormalImage,
-            m_document->textureMetalnessImage,
-            m_document->textureRoughnessImage,
-            m_document->textureAmbientOcclusionImage,
+            m_document->textureImage.get(),
+            m_document->textureNormalImage.get(),
+            m_document->textureMetalnessImage.get(),
+            m_document->textureRoughnessImage.get(),
+            m_document->textureAmbientOcclusionImage.get(),
             &m_document->getActualRigStructure(),
             &worker.inverseBindMatrices(),
             nullptr);
@@ -1505,11 +1749,11 @@ void DocumentWindow::exportFbxToFilename(const QString& filename)
     RigStructure rigStructure = m_document->getActualRigStructure();
     dust3d::Object rigObjectCopy = *rigObject;
     rigObjectCopy.copyUvFrom(uvObject);
-    QImage* textureImage = m_document->textureImage ? new QImage(*m_document->textureImage) : nullptr;
-    QImage* normalImage = m_document->textureNormalImage ? new QImage(*m_document->textureNormalImage) : nullptr;
-    QImage* metalnessImage = m_document->textureMetalnessImage ? new QImage(*m_document->textureMetalnessImage) : nullptr;
-    QImage* roughnessImage = m_document->textureRoughnessImage ? new QImage(*m_document->textureRoughnessImage) : nullptr;
-    QImage* aoImage = m_document->textureAmbientOcclusionImage ? new QImage(*m_document->textureAmbientOcclusionImage) : nullptr;
+    QImage* textureImage = m_document->textureImage.get() ? new QImage(*m_document->textureImage.get()) : nullptr;
+    QImage* normalImage = m_document->textureNormalImage.get() ? new QImage(*m_document->textureNormalImage.get()) : nullptr;
+    QImage* metalnessImage = m_document->textureMetalnessImage.get() ? new QImage(*m_document->textureMetalnessImage.get()) : nullptr;
+    QImage* roughnessImage = m_document->textureRoughnessImage.get() ? new QImage(*m_document->textureRoughnessImage.get()) : nullptr;
+    QImage* aoImage = m_document->textureAmbientOcclusionImage.get() ? new QImage(*m_document->textureAmbientOcclusionImage.get()) : nullptr;
 
     connect(thread, &QThread::started, worker, &ExportAnimationWorker::process);
     connect(worker, &ExportAnimationWorker::progress, this, [progressWidget](int current, int total) {
@@ -1551,11 +1795,11 @@ void DocumentWindow::exportGlbResult()
         return;
     QByteArray fileData;
     dust3d::Object skeletonResult = m_document->currentUvMappedObject();
-    QImage* textureMetalnessRoughnessAmbientOcclusionImage = UvMapGenerator::combineMetalnessRoughnessAmbientOcclusionImages(m_document->textureMetalnessImage,
-        m_document->textureRoughnessImage,
-        m_document->textureAmbientOcclusionImage);
+    QImage* textureMetalnessRoughnessAmbientOcclusionImage = UvMapGenerator::combineMetalnessRoughnessAmbientOcclusionImages(m_document->textureMetalnessImage.get(),
+        m_document->textureRoughnessImage.get(),
+        m_document->textureAmbientOcclusionImage.get());
     GlbFileWriter glbFileWriter(skeletonResult, m_currentFilename + ".glb",
-        m_document->textureImage, m_document->textureNormalImage, textureMetalnessRoughnessAmbientOcclusionImage);
+        m_document->textureImage.get(), m_document->textureNormalImage.get(), textureMetalnessRoughnessAmbientOcclusionImage);
     {
         QDataStream stream(&fileData, QIODeviceBase::Append);
         glbFileWriter.save(stream);
@@ -1573,27 +1817,31 @@ void DocumentWindow::exportGlbResult()
 #endif
 }
 
-void DocumentWindow::exportGlbToFilename(const QString& filename)
+void DocumentWindow::exportGlbToFilename(const QString& filename, std::function<void()> onFinished)
 {
     if (!m_document->isExportReady()) {
         qDebug() << "Export but document is not export ready";
+        if (onFinished)
+            onFinished();
         return;
     }
 
     QImage* ormImage = UvMapGenerator::combineMetalnessRoughnessAmbientOcclusionImages(
-        m_document->textureMetalnessImage,
-        m_document->textureRoughnessImage,
-        m_document->textureAmbientOcclusionImage);
+        m_document->textureMetalnessImage.get(),
+        m_document->textureRoughnessImage.get(),
+        m_document->textureAmbientOcclusionImage.get());
 
     if (!m_document->hasRigWithBindings()) {
         // No rig case: export mesh + UV + textures only
         QApplication::setOverrideCursor(Qt::WaitCursor);
         dust3d::Object uvObject = m_document->currentUvMappedObject();
         GlbFileWriter glbFileWriter(uvObject, filename,
-            m_document->textureImage, m_document->textureNormalImage, ormImage);
+            m_document->textureImage.get(), m_document->textureNormalImage.get(), ormImage);
         glbFileWriter.save();
         delete ormImage;
         QApplication::restoreOverrideCursor();
+        if (onFinished)
+            onFinished();
         return;
     }
 
@@ -1603,6 +1851,8 @@ void DocumentWindow::exportGlbToFilename(const QString& filename)
     if (rigObject->meshId != uvObject.meshId) {
         QMessageBox::warning(this, tr("Export"), tr("Rig generation is still in progress. Please wait and try again."));
         delete ormImage;
+        if (onFinished)
+            onFinished();
         return;
     }
 
@@ -1627,13 +1877,15 @@ void DocumentWindow::exportGlbToFilename(const QString& filename)
         dust3d::Object rigWithUv = *rigObject;
         rigWithUv.copyUvFrom(uvObject);
         GlbFileWriter glbFileWriter(rigWithUv, filename,
-            m_document->textureImage, m_document->textureNormalImage, ormImage,
+            m_document->textureImage.get(), m_document->textureNormalImage.get(), ormImage,
             &m_document->getActualRigStructure(),
             &worker.inverseBindMatrices(),
             nullptr);
         glbFileWriter.save();
         delete ormImage;
         QApplication::restoreOverrideCursor();
+        if (onFinished)
+            onFinished();
         return;
     }
 
@@ -1652,8 +1904,8 @@ void DocumentWindow::exportGlbToFilename(const QString& filename)
     RigStructure rigStructure = m_document->getActualRigStructure();
     dust3d::Object rigObjectCopy = *rigObject;
     rigObjectCopy.copyUvFrom(uvObject);
-    QImage* textureImage = m_document->textureImage ? new QImage(*m_document->textureImage) : nullptr;
-    QImage* normalImage = m_document->textureNormalImage ? new QImage(*m_document->textureNormalImage) : nullptr;
+    QImage* textureImage = m_document->textureImage.get() ? new QImage(*m_document->textureImage.get()) : nullptr;
+    QImage* normalImage = m_document->textureNormalImage.get() ? new QImage(*m_document->textureNormalImage.get()) : nullptr;
 
     connect(thread, &QThread::started, worker, &ExportAnimationWorker::process);
     connect(worker, &ExportAnimationWorker::progress, this, [progressWidget](int current, int total) {
@@ -1680,6 +1932,8 @@ void DocumentWindow::exportGlbToFilename(const QString& filename)
         progressWidget->deleteLater();
         worker->deleteLater();
         thread->quit();
+        if (onFinished)
+            onFinished();
     });
     connect(thread, &QThread::finished, thread, &QThread::deleteLater);
 
@@ -1752,15 +2006,15 @@ void DocumentWindow::exportModelAndWavs(const QString& directory, const QString&
     }
 
     // Copy texture images
-    QImage* textureImage = m_document->textureImage ? new QImage(*m_document->textureImage) : nullptr;
-    QImage* normalImage = m_document->textureNormalImage ? new QImage(*m_document->textureNormalImage) : nullptr;
-    QImage* metalnessImage = m_document->textureMetalnessImage ? new QImage(*m_document->textureMetalnessImage) : nullptr;
-    QImage* roughnessImage = m_document->textureRoughnessImage ? new QImage(*m_document->textureRoughnessImage) : nullptr;
-    QImage* aoImage = m_document->textureAmbientOcclusionImage ? new QImage(*m_document->textureAmbientOcclusionImage) : nullptr;
+    QImage* textureImage = m_document->textureImage.get() ? new QImage(*m_document->textureImage.get()) : nullptr;
+    QImage* normalImage = m_document->textureNormalImage.get() ? new QImage(*m_document->textureNormalImage.get()) : nullptr;
+    QImage* metalnessImage = m_document->textureMetalnessImage.get() ? new QImage(*m_document->textureMetalnessImage.get()) : nullptr;
+    QImage* roughnessImage = m_document->textureRoughnessImage.get() ? new QImage(*m_document->textureRoughnessImage.get()) : nullptr;
+    QImage* aoImage = m_document->textureAmbientOcclusionImage.get() ? new QImage(*m_document->textureAmbientOcclusionImage.get()) : nullptr;
     QImage* ormImage = UvMapGenerator::combineMetalnessRoughnessAmbientOcclusionImages(
-        m_document->textureMetalnessImage,
-        m_document->textureRoughnessImage,
-        m_document->textureAmbientOcclusionImage);
+        m_document->textureMetalnessImage.get(),
+        m_document->textureRoughnessImage.get(),
+        m_document->textureAmbientOcclusionImage.get());
 
     // Show progress dialog
     ExportProgressWidget* progressWidget = new ExportProgressWidget(this);
@@ -1969,8 +2223,9 @@ void DocumentWindow::checkExportWaitingList()
             exportFbxToFilename(filename);
             emit waitingExportFinished(filename, isSuccessful);
         } else if (filename.endsWith(".glb")) {
-            exportGlbToFilename(filename);
-            emit waitingExportFinished(filename, isSuccessful);
+            exportGlbToFilename(filename, [this, filename, isSuccessful]() {
+                emit waitingExportFinished(filename, isSuccessful);
+            });
         } else if (filename.endsWith(".ds3")) {
             saveTo(filename);
             emit waitingExportFinished(filename, true);
@@ -1990,29 +2245,35 @@ void DocumentWindow::generateComponentPreviewImages()
     m_isComponentPreviewImagesObsolete = false;
 
     m_componentPreviewImagesGenerator = new MeshPreviewImagesGenerator(new ModelOffscreenRender(m_modelRenderWidget->format()), devicePixelRatioF());
-    for (auto& component : m_document->componentMap) {
-        if (!component.second.isPreviewMeshObsolete)
-            continue;
-        component.second.isPreviewMeshObsolete = false;
-        auto previewMesh = std::unique_ptr<ModelMesh>(component.second.takePreviewMesh());
+
+    auto addComponentPreviewInput = [this](Document::Component& component, const dust3d::Uuid& componentId) {
+        if (!component.isPreviewMeshObsolete)
+            return;
+        component.isPreviewMeshObsolete = false;
+        auto previewMesh = std::unique_ptr<ModelMesh>(component.takePreviewMesh());
         if (nullptr == previewMesh)
-            continue;
+            return;
         bool useFrontView = false;
-        if (!component.second.linkToPartId.isNull()) {
-            const auto& part = m_document->findPart(component.second.linkToPartId);
+        if (!component.linkToPartId.isNull()) {
+            const auto& part = m_document->findPart(component.linkToPartId);
             if (nullptr != part) {
                 if (dust3d::PartTarget::CutFace == part->target)
                     useFrontView = true;
             }
         }
-        if (!component.second.colorImageId.isNull()) {
-            const auto& colorImage = ImageForever::get(component.second.colorImageId);
+        if (!component.colorImageId.isNull()) {
+            const auto& colorImage = ImageForever::get(component.colorImageId);
             if (nullptr != colorImage) {
                 previewMesh->setTextureImage(new QImage(*colorImage));
             }
         }
-        m_componentPreviewImagesGenerator->addInput(component.first, std::move(previewMesh), useFrontView);
+        m_componentPreviewImagesGenerator->addInput(componentId, std::move(previewMesh), useFrontView);
+    };
+
+    for (auto& component : m_document->componentMap) {
+        addComponentPreviewInput(component.second, component.first);
     }
+    addComponentPreviewInput(m_document->rootComponent, dust3d::Uuid());
 
     updateInprogressIndicator();
 
@@ -2070,17 +2331,23 @@ void DocumentWindow::decorateComponentPreviewImages()
     QThread* thread = new QThread;
 
     auto previewInputs = std::make_unique<std::vector<ComponentPreviewImagesDecorator::PreviewInput>>();
-    for (auto& component : m_document->componentMap) {
-        if (!component.second.isPreviewImageDecorationObsolete)
-            continue;
-        component.second.isPreviewImageDecorationObsolete = false;
-        if (nullptr == component.second.previewImage)
-            continue;
+
+    auto addDecorateInput = [&previewInputs](Document::Component& component, const dust3d::Uuid& componentId) {
+        if (!component.isPreviewImageDecorationObsolete)
+            return;
+        component.isPreviewImageDecorationObsolete = false;
+        if (nullptr == component.previewImage)
+            return;
         previewInputs->emplace_back(ComponentPreviewImagesDecorator::PreviewInput {
-            component.first,
-            std::make_unique<QImage>(*component.second.previewImage),
-            !component.second.childrenIds.empty() });
+            componentId,
+            std::make_unique<QImage>(*component.previewImage),
+            !component.childrenIds.empty() });
+    };
+
+    for (auto& component : m_document->componentMap) {
+        addDecorateInput(component.second, component.first);
     }
+    addDecorateInput(m_document->rootComponent, dust3d::Uuid());
     m_componentPreviewImagesDecorator = std::make_unique<ComponentPreviewImagesDecorator>(std::move(previewInputs));
     m_componentPreviewImagesDecorator->moveToThread(thread);
     connect(thread, &QThread::started, m_componentPreviewImagesDecorator.get(), &ComponentPreviewImagesDecorator::process);
@@ -2118,6 +2385,21 @@ ModelWidget* DocumentWindow::modelWidget()
     return m_modelRenderWidget;
 }
 
+SkeletonGraphicsWidget* DocumentWindow::canvasGraphicsWidget()
+{
+    return m_canvasGraphicsWidget;
+}
+
+BoneManageWidget* DocumentWindow::boneManageWidget()
+{
+    return m_boneManageWidget;
+}
+
+AnimationManageWidget* DocumentWindow::animationManageWidget()
+{
+    return m_animationManageWidget;
+}
+
 QShortcut* DocumentWindow::createShortcut(QKeySequence key)
 {
     auto shortcutIt = m_shortcutMap.find(key);
@@ -2135,27 +2417,17 @@ QShortcut* DocumentWindow::createShortcut(QKeySequence key)
 void DocumentWindow::initializeToolShortcuts(SkeletonGraphicsWidget* graphicsWidget)
 {
     defineShortcut(Qt::Key_A, graphicsWidget, &SkeletonGraphicsWidget::shortcutAddMode);
-    defineShortcut(Qt::CTRL | Qt::Key_A, graphicsWidget, &SkeletonGraphicsWidget::shortcutSelectAll);
-    defineShortcut(Qt::CTRL | Qt::Key_Z, graphicsWidget, &SkeletonGraphicsWidget::shortcutUndo);
-    defineShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_Z, graphicsWidget, &SkeletonGraphicsWidget::shortcutRedo);
-    defineShortcut(Qt::CTRL | Qt::Key_Y, graphicsWidget, &SkeletonGraphicsWidget::shortcutRedo);
     defineShortcut(Qt::Key_Z, graphicsWidget, &SkeletonGraphicsWidget::shortcutZlock);
     defineShortcut(Qt::Key_Y, graphicsWidget, &SkeletonGraphicsWidget::shortcutYlock);
     defineShortcut(Qt::Key_X, graphicsWidget, &SkeletonGraphicsWidget::shortcutXlock);
     defineShortcut(Qt::Key_S, graphicsWidget, &SkeletonGraphicsWidget::shortcutSelectMode);
-    defineShortcut(Qt::Key_R, graphicsWidget, &SkeletonGraphicsWidget::shortcutToggleRotation);
-    defineShortcut(Qt::Key_O, graphicsWidget, &SkeletonGraphicsWidget::shortcutToggleFlatShading);
-    defineShortcut(Qt::Key_W, graphicsWidget, &SkeletonGraphicsWidget::shortcutToggleWireframe);
+    defineShortcut(Qt::Key_Space, graphicsWidget, &SkeletonGraphicsWidget::shortcutShowComponentProperty);
     defineShortcut(Qt::Key_Escape, graphicsWidget, &SkeletonGraphicsWidget::shortcutEscape);
 }
 
 void DocumentWindow::initializeCanvasShortcuts(SkeletonGraphicsWidget* graphicsWidget)
 {
-    defineShortcut(Qt::Key_Delete, graphicsWidget, &SkeletonGraphicsWidget::shortcutDelete);
     defineShortcut(Qt::Key_Backspace, graphicsWidget, &SkeletonGraphicsWidget::shortcutDelete);
-    defineShortcut(Qt::CTRL | Qt::Key_X, graphicsWidget, &SkeletonGraphicsWidget::shortcutCut);
-    defineShortcut(Qt::CTRL | Qt::Key_C, graphicsWidget, &SkeletonGraphicsWidget::shortcutCopy);
-    defineShortcut(Qt::CTRL | Qt::Key_V, graphicsWidget, &SkeletonGraphicsWidget::shortcutPaste);
     defineShortcut(Qt::ALT | Qt::Key_Minus, graphicsWidget, &SkeletonGraphicsWidget::shortcutZoomRenderedModelByMinus10);
     defineShortcut(Qt::Key_Minus, graphicsWidget, &SkeletonGraphicsWidget::shortcutZoomSelectedByMinus1);
     defineShortcut(Qt::ALT | Qt::Key_Equal, graphicsWidget, &SkeletonGraphicsWidget::shortcutZoomRenderedModelBy10);
@@ -2170,6 +2442,7 @@ void DocumentWindow::initializeCanvasShortcuts(SkeletonGraphicsWidget* graphicsW
     defineShortcut(Qt::Key_BracketRight, graphicsWidget, &SkeletonGraphicsWidget::shortcutScaleSelectedBy1);
     defineShortcut(Qt::Key_E, graphicsWidget, &SkeletonGraphicsWidget::shortcutSwitchProfileOnSelected);
     defineShortcut(Qt::Key_H, graphicsWidget, &SkeletonGraphicsWidget::shortcutShowOrHideSelectedPart);
+    defineShortcut(Qt::SHIFT | Qt::Key_H, graphicsWidget, &SkeletonGraphicsWidget::shortcutHideOtherParts);
     defineShortcut(Qt::Key_J, graphicsWidget, &SkeletonGraphicsWidget::shortcutEnableOrDisableSelectedPart);
     defineShortcut(Qt::Key_L, graphicsWidget, &SkeletonGraphicsWidget::shortcutLockOrUnlockSelectedPart);
     defineShortcut(Qt::Key_F, graphicsWidget, &SkeletonGraphicsWidget::shortcutCheckPartComponent);
@@ -2184,6 +2457,18 @@ void DocumentWindow::initializeShortcuts()
     defineShortcut(Qt::Key_B, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutSubdivedOrNotSelectedPart);
     defineShortcut(Qt::Key_U, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutRoundEndOrNotSelectedPart);
     defineShortcut(Qt::Key_C, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutChamferedOrNotSelectedPart);
+
+    // Edit menu commands: QShortcut owns the key binding so shortcuts are
+    // always active regardless of the QAction's enabled state (which is
+    // managed separately in the aboutToShow handler for menu appearance only).
+    defineShortcut(QKeySequence::Undo, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutUndo);
+    defineShortcut(QKeySequence::Redo, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutRedo);
+    defineShortcut(QKeySequence(Qt::CTRL | Qt::Key_Y), m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutRedo);
+    defineShortcut(QKeySequence::Cut, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutCut);
+    defineShortcut(QKeySequence::Copy, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutCopy);
+    defineShortcut(QKeySequence::Paste, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutPaste);
+    defineShortcut(QKeySequence::Delete, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutDelete);
+    defineShortcut(QKeySequence::SelectAll, m_canvasGraphicsWidget, &SkeletonGraphicsWidget::shortcutSelectAll);
 }
 
 void DocumentWindow::openRecentFile()

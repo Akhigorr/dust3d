@@ -40,7 +40,6 @@ AnimationManageWidget::AnimationManageWidget(Document* document, QWidget* parent
     m_modelWidget->enableZoom(true);
     m_modelWidget->enableMove(true);
     m_modelWidget->setMoveAndZoomByWindow(false);
-    m_modelWidget->toggleWireframe();
 
     setLayout(mainLayout);
 
@@ -99,13 +98,15 @@ void AnimationManageWidget::createParameterWidgets()
     groupBoxLayout->addWidget(m_modelWidget);
 
     // Preview-specific options (not animation parameters)
-    m_hideBonesCheck = new QCheckBox("Hide Bones");
-    m_hideBonesCheck->setChecked(true);
-    m_hidePartsCheck = new QCheckBox("Hide Parts");
-    m_hidePartsCheck->setChecked(false);
-    m_hideWeightsCheck = new QCheckBox("Hide Weights");
+    m_hideBonesCheck = new QCheckBox("Bones");
+    m_hideBonesCheck->setChecked(false);
+    m_hidePartsCheck = new QCheckBox("Model");
+    m_hidePartsCheck->setChecked(true);
+    m_hideWeightsCheck = new QCheckBox("Weights");
     m_hideWeightsCheck->setToolTip("Weights show when a bone is selected, unless they have no effect");
-    m_hideWeightsCheck->setChecked(true);
+    m_hideWeightsCheck->setChecked(false);
+    m_wireframeCheck = new QCheckBox("Wireframe");
+    m_wireframeCheck->setChecked(false);
 
     QWidget* previewOptionWidget = new QWidget;
     QHBoxLayout* previewOptionLayout = new QHBoxLayout(previewOptionWidget);
@@ -113,6 +114,7 @@ void AnimationManageWidget::createParameterWidgets()
     previewOptionLayout->addWidget(m_hideBonesCheck);
     previewOptionLayout->addWidget(m_hidePartsCheck);
     previewOptionLayout->addWidget(m_hideWeightsCheck);
+    previewOptionLayout->addWidget(m_wireframeCheck);
     previewOptionLayout->addStretch();
     groupBoxLayout->addWidget(previewOptionWidget);
 
@@ -218,6 +220,10 @@ void AnimationManageWidget::createParameterWidgets()
     connect(m_hideBonesCheck, &QCheckBox::toggled, this, &AnimationManageWidget::onParameterChanged);
     connect(m_hidePartsCheck, &QCheckBox::toggled, this, &AnimationManageWidget::onParameterChanged);
     connect(m_hideWeightsCheck, &QCheckBox::toggled, this, &AnimationManageWidget::onParameterChanged);
+    connect(m_wireframeCheck, &QCheckBox::toggled, this, [this](bool checked) {
+        if (m_modelWidget)
+            m_modelWidget->setWireframeVisible(checked);
+    });
 
     connect(m_playSoundCheck, &QCheckBox::toggled, this, &AnimationManageWidget::onParameterChanged);
     connect(m_surfaceMaterialCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &AnimationManageWidget::onParameterChanged);
@@ -376,63 +382,67 @@ void AnimationManageWidget::updateAnimationNameForRigType(const QString& rigType
 
     m_animationNameCombo->clear();
     if (rigType.compare("Insect", Qt::CaseInsensitive) == 0) {
+        m_animationNameCombo->addItem("InsectAttack");
+        m_animationNameCombo->addItem("InsectDie");
+        m_animationNameCombo->addItem("InsectFly");
         m_animationNameCombo->addItem("InsectIdle");
         m_animationNameCombo->addItem("InsectRubHands");
         m_animationNameCombo->addItem("InsectWalk");
-        m_animationNameCombo->addItem("InsectFly");
-        m_animationNameCombo->addItem("InsectAttack");
-        m_animationNameCombo->addItem("InsectDie");
         m_animationNameCombo->setEnabled(true);
         m_addAnimationButton->setEnabled(true);
     } else if (rigType.compare("Bird", Qt::CaseInsensitive) == 0) {
-        m_animationNameCombo->addItem("BirdIdle");
+        m_animationNameCombo->addItem("BirdAttack");
+        m_animationNameCombo->addItem("BirdDie");
+        m_animationNameCombo->addItem("BirdEat");
         m_animationNameCombo->addItem("BirdFly");
         m_animationNameCombo->addItem("BirdGlide");
-        m_animationNameCombo->addItem("BirdWalk");
+        m_animationNameCombo->addItem("BirdIdle");
         m_animationNameCombo->addItem("BirdRun");
-        m_animationNameCombo->addItem("BirdAttack");
-        m_animationNameCombo->addItem("BirdEat");
-        m_animationNameCombo->addItem("BirdDie");
+        m_animationNameCombo->addItem("BirdWalk");
         m_animationNameCombo->setEnabled(true);
         m_addAnimationButton->setEnabled(true);
     } else if (rigType.compare("Fish", Qt::CaseInsensitive) == 0) {
+        m_animationNameCombo->addItem("FishDie");
         m_animationNameCombo->addItem("FishIdle");
         m_animationNameCombo->addItem("FishSwim");
-        m_animationNameCombo->addItem("FishDie");
         m_animationNameCombo->setEnabled(true);
         m_addAnimationButton->setEnabled(true);
     } else if (rigType.compare("Biped", Qt::CaseInsensitive) == 0) {
+        m_animationNameCombo->addItem("BipedCast");
+        m_animationNameCombo->addItem("BipedChannel");
+        m_animationNameCombo->addItem("BipedDie");
+        m_animationNameCombo->addItem("BipedHurt");
         m_animationNameCombo->addItem("BipedIdle");
-        m_animationNameCombo->addItem("BipedWalk");
-        m_animationNameCombo->addItem("BipedRun");
         m_animationNameCombo->addItem("BipedJump");
         m_animationNameCombo->addItem("BipedRoar");
-        m_animationNameCombo->addItem("BipedHurt");
-        m_animationNameCombo->addItem("BipedDie");
+        m_animationNameCombo->addItem("BipedRun");
+        m_animationNameCombo->addItem("BipedSlam");
+        m_animationNameCombo->addItem("BipedStab");
+        m_animationNameCombo->addItem("BipedWalk");
         m_animationNameCombo->setEnabled(true);
         m_addAnimationButton->setEnabled(true);
     } else if (rigType.compare("Quadruped", Qt::CaseInsensitive) == 0) {
-        m_animationNameCombo->addItem("QuadrupedIdle");
-        m_animationNameCombo->addItem("QuadrupedWalk");
-        m_animationNameCombo->addItem("QuadrupedRun");
         m_animationNameCombo->addItem("QuadrupedAttack");
-        m_animationNameCombo->addItem("QuadrupedRoar");
-        m_animationNameCombo->addItem("QuadrupedHurt");
-        m_animationNameCombo->addItem("QuadrupedEat");
         m_animationNameCombo->addItem("QuadrupedDie");
+        m_animationNameCombo->addItem("QuadrupedEat");
+        m_animationNameCombo->addItem("QuadrupedHurt");
+        m_animationNameCombo->addItem("QuadrupedIdle");
+        m_animationNameCombo->addItem("QuadrupedRoar");
+        m_animationNameCombo->addItem("QuadrupedRun");
+        m_animationNameCombo->addItem("QuadrupedWalk");
         m_animationNameCombo->setEnabled(true);
         m_addAnimationButton->setEnabled(true);
     } else if (rigType.compare("Spider", Qt::CaseInsensitive) == 0) {
-        m_animationNameCombo->addItem("SpiderIdle");
-        m_animationNameCombo->addItem("SpiderWalk");
-        m_animationNameCombo->addItem("SpiderRun");
         m_animationNameCombo->addItem("SpiderDie");
+        m_animationNameCombo->addItem("SpiderIdle");
+        m_animationNameCombo->addItem("SpiderRun");
+        m_animationNameCombo->addItem("SpiderWalk");
         m_animationNameCombo->setEnabled(true);
         m_addAnimationButton->setEnabled(true);
     } else if (rigType.compare("Snake", Qt::CaseInsensitive) == 0) {
+        m_animationNameCombo->addItem("SnakeDie");
         m_animationNameCombo->addItem("SnakeIdle");
         m_animationNameCombo->addItem("SnakeSlither");
-        m_animationNameCombo->addItem("SnakeDie");
         m_animationNameCombo->setEnabled(true);
         m_addAnimationButton->setEnabled(true);
     } else {
@@ -481,12 +491,6 @@ AnimationManageWidget::~AnimationManageWidget()
 {
     stopSoundPlayback();
     stopAnimationLoop();
-}
-
-void AnimationManageWidget::setWireframeVisible(bool visible)
-{
-    if (m_modelWidget)
-        m_modelWidget->setWireframeVisible(visible);
 }
 
 void AnimationManageWidget::updateParametersGroupBoxTitle()
@@ -568,10 +572,10 @@ void AnimationManageWidget::onResultRigChanged()
     }
 
     m_animationWorker->setParameters(actualRig, animationType.toStdString(), m_animationParams);
-    m_animationWorker->setHideBones(m_hideBonesCheck ? m_hideBonesCheck->isChecked() : false);
-    m_animationWorker->setHideParts(m_hidePartsCheck ? m_hidePartsCheck->isChecked() : false);
+    m_animationWorker->setHideBones(m_hideBonesCheck ? !m_hideBonesCheck->isChecked() : true);
+    m_animationWorker->setHideParts(m_hidePartsCheck ? !m_hidePartsCheck->isChecked() : true);
     m_animationWorker->setSelectedBoneName(
-        (m_hideWeightsCheck && m_hideWeightsCheck->isChecked()) ? QString() : m_selectedBoneName);
+        (m_hideWeightsCheck && !m_hideWeightsCheck->isChecked()) ? QString() : m_selectedBoneName);
 
     // Sound settings
     bool soundEnabled = m_playSoundCheck && m_playSoundCheck->isChecked();
@@ -583,6 +587,8 @@ void AnimationManageWidget::onResultRigChanged()
 
     dust3d::Object* rigObject = m_document->takeRigObject();
     m_animationWorker->setRigObject(std::unique_ptr<dust3d::Object>(rigObject));
+    if (m_document->textureImage)
+        m_animationWorker->setTextureImage(std::make_unique<QImage>(*m_document->textureImage));
 
     auto thread = new QThread;
     m_animationWorker->moveToThread(thread);
@@ -834,8 +840,6 @@ void AnimationManageWidget::onAddAnimationClicked()
     m_parametersGroupBox->setTitle(tr("Parameters"));
     m_parametersGroupBox->show();
     m_bottomStretch->hide();
-    m_animationNameInput->setFocus();
-
     rebuildDynamicControls(type);
 
     autoSaveCurrentAnimation();
@@ -1016,6 +1020,30 @@ void AnimationManageWidget::loadAnimationIntoForm(const dust3d::Uuid& animationI
 
     m_animationParams = params;
     triggerPreviewRegeneration();
+}
+
+void AnimationManageWidget::selectAnimationById(const dust3d::Uuid& animationId)
+{
+    if (!m_animationListWidget)
+        return;
+    QString idStr = QString::fromStdString(animationId.toString());
+    for (int i = 0; i < m_animationListWidget->count(); ++i) {
+        QListWidgetItem* item = m_animationListWidget->item(i);
+        if (item->data(Qt::UserRole).toString() == idStr) {
+            m_animationListWidget->setCurrentItem(item);
+            return;
+        }
+    }
+}
+
+void AnimationManageWidget::setParameterSliderValue(const std::string& paramName, int sliderValue)
+{
+    for (auto& ctrl : m_dynamicControls) {
+        if (ctrl.paramName == paramName && ctrl.slider) {
+            ctrl.slider->setValue(sliderValue);
+            return;
+        }
+    }
 }
 
 void AnimationManageWidget::onSelectedBoneChanged(const QString& boneName)

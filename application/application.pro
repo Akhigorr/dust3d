@@ -7,8 +7,8 @@ greaterThan(QT_MAJOR_VERSION, 5) {
 TARGET = dust3d
 TEMPLATE = app
 
-HUMAN_VERSION = "1.0.0"
-VERSION = 1.0.0.40
+HUMAN_VERSION = "1.1.7"
+VERSION = 1.1.7.0
 
 QMAKE_TARGET_COMPANY = Dust3D
 QMAKE_TARGET_PRODUCT = Dust3D
@@ -28,29 +28,32 @@ CONFIG += no_batch
 CONFIG += c++17
 
 CONFIG(release, debug|release) {
-    win32 {
-        QMAKE_CXXFLAGS += /MP
-        QMAKE_CXXFLAGS += /O2
-        QMAKE_CXXFLAGS += /bigobj
-        
-        CONFIG += force_debug_info
-    }
+    DEFINES += NDEBUG
+}
 
-    macx {
-        QMAKE_CXXFLAGS_RELEASE -= -O
-        QMAKE_CXXFLAGS_RELEASE -= -O1
-        QMAKE_CXXFLAGS_RELEASE -= -O2
+win32 {
+    QMAKE_CXXFLAGS += /MP
+    QMAKE_CXXFLAGS += /O2
+    QMAKE_CXXFLAGS += /bigobj
+    
+    CONFIG += force_debug_info
+}
 
-        QMAKE_CXXFLAGS_RELEASE += -O3
-    }
+macx {
+    QMAKE_CXXFLAGS_RELEASE -= -O
+    QMAKE_CXXFLAGS_RELEASE -= -O1
+    QMAKE_CXXFLAGS_RELEASE -= -O2
 
-    unix:!macx {
-        QMAKE_CXXFLAGS_RELEASE -= -O
-        QMAKE_CXXFLAGS_RELEASE -= -O1
-        QMAKE_CXXFLAGS_RELEASE -= -O2
+    QMAKE_CXXFLAGS_RELEASE += -O3
+    QMAKE_CXXFLAGS += -Wno-error=implicit-function-declaration
+}
 
-        QMAKE_CXXFLAGS_RELEASE += -O3
-    }
+unix:!macx {
+    QMAKE_CXXFLAGS_RELEASE -= -O
+    QMAKE_CXXFLAGS_RELEASE -= -O1
+    QMAKE_CXXFLAGS_RELEASE -= -O2
+
+    QMAKE_CXXFLAGS_RELEASE += -O3
 }
 
 QMAKE_LFLAGS += -Os
@@ -104,6 +107,8 @@ SOURCES += sources/about_widget.cc
 HEADERS += sources/bone_structure.h
 HEADERS += sources/bone_manage_widget.h
 SOURCES += sources/bone_manage_widget.cc
+HEADERS += sources/bone_property_widget.h
+SOURCES += sources/bone_property_widget.cc
 HEADERS += sources/rig_skeleton_mesh_generator.h
 SOURCES += sources/rig_skeleton_mesh_generator.cc
 HEADERS += sources/rig_skeleton_mesh_worker.h
@@ -111,6 +116,8 @@ SOURCES += sources/rig_skeleton_mesh_worker.cc
 HEADERS += sources/rig_generator_worker.h
 HEADERS += sources/ccd_ik_resolver.h
 SOURCES += sources/ccd_ik_resolver.cc
+HEADERS += sources/component_breadcrumb_widget.h
+SOURCES += sources/component_breadcrumb_widget.cc
 HEADERS += sources/component_list_model.h
 SOURCES += sources/component_list_model.cc
 HEADERS += sources/component_preview_grid_widget.h
@@ -121,8 +128,6 @@ HEADERS += sources/component_property_widget.h
 SOURCES += sources/component_property_widget.cc
 HEADERS += sources/cut_face_preview.h
 SOURCES += sources/cut_face_preview.cc
-HEADERS += sources/dds_file.h
-SOURCES += sources/dds_file.cc
 HEADERS += sources/debug.h
 SOURCES += sources/debug.cc
 HEADERS += sources/document.h
@@ -135,6 +140,8 @@ HEADERS += sources/document_saver.h
 SOURCES += sources/document_saver.cc
 HEADERS += sources/document_window.h
 SOURCES += sources/document_window.cc
+HEADERS += sources/steps_replay_window.h
+SOURCES += sources/steps_replay_window.cc
 HEADERS += sources/turnaround_overlay_widget.h
 SOURCES += sources/turnaround_overlay_widget.cc
 HEADERS += sources/fbx_file.h
@@ -145,6 +152,10 @@ HEADERS += sources/flow_layout.h
 SOURCES += sources/flow_layout.cc
 HEADERS += sources/glb_file.h
 SOURCES += sources/glb_file.cc
+HEADERS += sources/glb_forever.h
+SOURCES += sources/glb_forever.cc
+HEADERS += sources/glb_reader.h
+SOURCES += sources/glb_reader.cc
 HEADERS += sources/graphics_container_widget.h
 SOURCES += sources/graphics_container_widget.cc
 HEADERS += sources/horizontal_line_widget.h
@@ -368,6 +379,14 @@ HEADERS += ../dust3d/animation/biped/idle.h
 SOURCES += ../dust3d/animation/biped/idle.cc
 HEADERS += ../dust3d/animation/biped/roar.h
 SOURCES += ../dust3d/animation/biped/roar.cc
+HEADERS += ../dust3d/animation/biped/slam.h
+SOURCES += ../dust3d/animation/biped/slam.cc
+HEADERS += ../dust3d/animation/biped/stab.h
+SOURCES += ../dust3d/animation/biped/stab.cc
+HEADERS += ../dust3d/animation/biped/cast.h
+SOURCES += ../dust3d/animation/biped/cast.cc
+HEADERS += ../dust3d/animation/biped/channel.h
+SOURCES += ../dust3d/animation/biped/channel.cc
 HEADERS += ../dust3d/animation/quadruped/idle.h
 SOURCES += ../dust3d/animation/quadruped/idle.cc
 HEADERS += ../dust3d/animation/insect/idle.h
@@ -410,8 +429,11 @@ HEADERS += ../dust3d/mesh/section_remesher.h
 SOURCES += ../dust3d/mesh/section_remesher.cc
 HEADERS += ../dust3d/mesh/smooth_normal.h
 SOURCES += ../dust3d/mesh/smooth_normal.cc
+HEADERS += ../dust3d/mesh/spine_deformer.h
 HEADERS += ../dust3d/mesh/stitch_mesh_builder.h
 SOURCES += ../dust3d/mesh/stitch_mesh_builder.cc
+HEADERS += ../dust3d/mesh/stitch_loop_mesh_builder.h
+SOURCES += ../dust3d/mesh/stitch_loop_mesh_builder.cc
 HEADERS += ../dust3d/mesh/triangulate.h
 SOURCES += ../dust3d/mesh/triangulate.cc
 HEADERS += ../dust3d/mesh/trim_vertices.h

@@ -17,6 +17,7 @@
 #include <QShowEvent>
 #include <QString>
 #include <QStringList>
+#include <functional>
 #include <map>
 #include <memory>
 #include <vector>
@@ -45,6 +46,9 @@ public:
     ~DocumentWindow();
     Document* document();
     ModelWidget* modelWidget();
+    SkeletonGraphicsWidget* canvasGraphicsWidget();
+    BoneManageWidget* boneManageWidget();
+    AnimationManageWidget* animationManageWidget();
     bool isWorking();
     static DocumentWindow* createDocumentWindow();
     static const std::map<DocumentWindow*, dust3d::Uuid>& documentWindows();
@@ -61,6 +65,8 @@ protected:
     void mousePressEvent(QMouseEvent* event);
     void dragEnterEvent(QDragEnterEvent* event) override;
     void dropEvent(QDropEvent* event) override;
+    void changeEvent(QEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
 public slots:
     void changeTurnaround();
     void loadTurnaroundImageFiles(QStringList fileNames);
@@ -97,7 +103,7 @@ public slots:
     void checkExportWaitingList();
     void exportObjToFilename(const QString& filename);
     void exportFbxToFilename(const QString& filename);
-    void exportGlbToFilename(const QString& filename);
+    void exportGlbToFilename(const QString& filename, std::function<void()> onFinished = nullptr);
     void exportModelAndWavs(const QString& directory, const QString& format);
     void toggleRotation();
     void generateComponentPreviewImages();
@@ -115,6 +121,7 @@ public slots:
     void forceUpdateRenderWireframe();
     void onBonesDockerVisibilityChanged(bool visible);
     void onAnimationsDockerVisibilityChanged(bool visible);
+    void showKeyboardShortcuts();
 
 private:
     void setCurrentFilename(const QString& filename);
@@ -122,6 +129,7 @@ private:
     void initializeShortcuts();
     void initializeToolShortcuts(SkeletonGraphicsWidget* graphicsWidget);
     void initializeCanvasShortcuts(SkeletonGraphicsWidget* graphicsWidget);
+    void makeDockWidgetsNonFocusable();
     QShortcut* createShortcut(QKeySequence key);
     QString strippedName(const QString& fullFileName);
     bool openFiles(const QStringList& pathList);
@@ -148,6 +156,15 @@ private:
     QVBoxLayout* m_turnaroundRecentFilesLayout = nullptr;
     QWidget* m_leftToolPanel = nullptr;
     QMenu* m_fileMenu = nullptr;
+    QMenu* m_editMenu = nullptr;
+    QAction* m_undoAction = nullptr;
+    QAction* m_redoAction = nullptr;
+    QAction* m_cutAction = nullptr;
+    QAction* m_copyAction = nullptr;
+    QAction* m_pasteAction = nullptr;
+    QAction* m_deleteAction = nullptr;
+    QAction* m_selectAllAction = nullptr;
+    QAction* m_keyboardShortcutsAction = nullptr;
     QAction* m_newDocumentAction = nullptr;
     QAction* m_openAction = nullptr;
     QAction* m_saveAction = nullptr;
@@ -177,6 +194,7 @@ private:
     QAction* m_showBonesListAction = nullptr;
     QAction* m_showAnimationsListAction = nullptr;
     QAction* m_showDebugDialogAction = nullptr;
+    QAction* m_workflowReplayAction = nullptr;
 
     QMenu* m_helpMenu = nullptr;
     QAction* m_gotoHomepageAction = nullptr;

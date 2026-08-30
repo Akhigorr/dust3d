@@ -1,9 +1,11 @@
 #include "part_manage_widget.h"
+#include "component_breadcrumb_widget.h"
 #include "component_list_model.h"
 #include "component_preview_grid_widget.h"
 #include "component_property_widget.h"
 #include "document.h"
 #include "theme.h"
+#include <QFile>
 #include <QMenu>
 #include <QVBoxLayout>
 #include <QWidgetAction>
@@ -55,8 +57,20 @@ PartManageWidget::PartManageWidget(Document* document, QWidget* parent)
 
     m_componentPreviewGridWidget = new ComponentPreviewGridWidget(document);
 
+    m_breadcrumbWidget = new ComponentBreadcrumbWidget(document);
+    m_breadcrumbWidget->setCurrentComponentId(dust3d::Uuid());
+
     connect(m_componentPreviewGridWidget->selectionModel(), &QItemSelectionModel::selectionChanged, this, &PartManageWidget::updateToolButtons);
     connect(m_componentPreviewGridWidget->componentListModel(), &ComponentListModel::listingComponentChanged, this, &PartManageWidget::updateLevelUpButton);
+    connect(m_componentPreviewGridWidget->componentListModel(), &ComponentListModel::listingComponentChanged, [this](const dust3d::Uuid& componentId) {
+        m_breadcrumbWidget->setCurrentComponentId(componentId);
+    });
+    connect(m_breadcrumbWidget, &ComponentBreadcrumbWidget::navigateToComponent, [this](const dust3d::Uuid& componentId) {
+        m_componentPreviewGridWidget->componentListModel()->setListingComponentId(componentId);
+    });
+    connect(m_document, &Document::componentPreviewPixmapChanged, [this](const dust3d::Uuid&) {
+        m_breadcrumbWidget->updateThumbnails();
+    });
     connect(m_componentPreviewGridWidget, &ComponentPreviewGridWidget::unselectAllOnCanvas, this, &PartManageWidget::unselectAllOnCanvas);
     connect(m_componentPreviewGridWidget, &ComponentPreviewGridWidget::selectPartOnCanvas, this, &PartManageWidget::selectPartOnCanvas);
 
@@ -132,6 +146,7 @@ PartManageWidget::PartManageWidget(Document* document, QWidget* parent)
 
     QVBoxLayout* mainLayout = new QVBoxLayout;
     mainLayout->addWidget(toolsWidget);
+    mainLayout->addWidget(m_breadcrumbWidget);
     mainLayout->addWidget(m_componentPreviewGridWidget);
 
     setLayout(mainLayout);
@@ -159,6 +174,28 @@ void PartManageWidget::showSelectedComponentProperties()
     m_contextMenu->popup(QPoint(
         x - propertyWidget->width(),
         QCursor::pos().y()));
+}
+
+void PartManageWidget::showComponentPropertyForParts(std::set<dust3d::Uuid> partIds)
+{
+    std::vector<dust3d::Uuid> componentIds;
+    for (const auto& partId : partIds) {
+        const auto* part = m_document->findPart(partId);
+        if (nullptr == part)
+            continue;
+        componentIds.push_back(part->componentId);
+    }
+    if (componentIds.empty())
+        return;
+
+    auto* propertyWidget = new ComponentPropertyWidget(m_document, componentIds);
+
+    m_contextMenu.reset(new QMenu(this->parentWidget()));
+    QWidgetAction* widgetAction = new QWidgetAction(m_contextMenu.get());
+    widgetAction->setDefaultWidget(propertyWidget);
+    m_contextMenu->addAction(widgetAction);
+
+    m_contextMenu->popup(QCursor::pos());
 }
 
 void PartManageWidget::selectComponentByPartId(const dust3d::Uuid& partId)
@@ -314,46 +351,75 @@ void PartManageWidget::showContextMenu(const QPoint& pos)
         moveToMenu->addSeparator();
     }
 
-    QAction* convertToCutFaceAction = new QAction(tr("Convert to Cut Face"), m_contextMenu.get());
-    QAction* convertToStitchingLineAction = new QAction(tr("Convert to Stitching Line"), m_contextMenu.get());
-    QAction* convertToPartAction = new QAction(tr("Convert to Model"), m_contextMenu.get());
     auto selectedPartIds = m_componentPreviewGridWidget->getSelectedPartIds();
     if (!selectedPartIds.empty()) {
-        bool addConvertToPartAction = false;
-        bool addConvertToCutFaceAction = false;
-        bool addConvertToStitchingLineAction = false;
-        for (const auto& it : selectedPartIds) {
-            const Document::Part* part = m_document->findPart(it);
-            if (dust3d::PartTarget::Model != part->target) {
-                addConvertToPartAction = true;
-            } else {
-                addConvertToCutFaceAction = true;
-                addConvertToStitchingLineAction = true;
+        QMenu* partRoleMenu = m_contextMenu->addMenu(tr("Part Role"));
+        struct RoleEntry {
+            QString label;
+            dust3d::PartTarget target;
+        };
+        RoleEntry roles[] = {
+            { tr("Model"), dust3d::PartTarget::Model },
+            { tr("Cut Face"), dust3d::PartTarget::CutFace },
+            { tr("Stitching Line"), dust3d::PartTarget::StitchingLine },
+            { tr("Stitching Loop"), dust3d::PartTarget::StitchingLoop },
+            { tr("Imported Model"), dust3d::PartTarget::ImportedModel },
+        };
+        for (const auto& role : roles) {
+            QAction* action = new QAction(role.label, partRoleMenu);
+            bool allMatch = true;
+            for (const auto& it : selectedPartIds) {
+                const Document::Part* part = m_document->findPart(it);
+                if (part->target != role.target) {
+                    allMatch = false;
+                    break;
+                }
             }
-        }
-        if (addConvertToPartAction) {
-            connect(convertToPartAction, &QAction::triggered, this, [=]() {
+            action->setCheckable(true);
+            action->setChecked(allMatch);
+            dust3d::PartTarget target = role.target;
+            connect(action, &QAction::triggered, this, [=]() {
                 for (const auto& it : selectedPartIds)
-                    emit this->setPartTarget(it, dust3d::PartTarget::Model);
+                    emit this->setPartTarget(it, target);
+                if (selectedPartIds.size() > 1
+                    && (target == dust3d::PartTarget::StitchingLine || target == dust3d::PartTarget::StitchingLoop)) {
+                    std::vector<dust3d::Uuid> componentIds;
+                    for (const auto& partId : selectedPartIds) {
+                        const Document::Part* part = m_document->findPart(partId);
+                        if (part && !part->componentId.isNull())
+                            componentIds.push_back(part->componentId);
+                    }
+                    if (componentIds.size() > 1) {
+                        const auto* first = m_document->findComponent(componentIds.front());
+                        bool alreadyGrouped = first && !first->parentId.isNull();
+                        if (alreadyGrouped) {
+                            auto groupId = first->parentId;
+                            const auto* group = m_document->findComponent(groupId);
+                            if (group && !group->linkToPartId.isNull())
+                                alreadyGrouped = false;
+                            else {
+                                for (size_t i = 1; i < componentIds.size(); ++i) {
+                                    const auto* c = m_document->findComponent(componentIds[i]);
+                                    if (!c || c->parentId != groupId) {
+                                        alreadyGrouped = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (alreadyGrouped) {
+                            m_componentPreviewGridWidget->componentListModel()->setListingComponentId(first->parentId);
+                        } else {
+                            emit this->groupComponents(componentIds);
+                            const auto* child = m_document->findComponent(componentIds.front());
+                            if (child && !child->parentId.isNull())
+                                m_componentPreviewGridWidget->componentListModel()->setListingComponentId(child->parentId);
+                        }
+                    }
+                }
                 emit this->groupOperationAdded();
             });
-            m_contextMenu->addAction(convertToPartAction);
-        }
-        if (addConvertToCutFaceAction) {
-            connect(convertToCutFaceAction, &QAction::triggered, this, [=]() {
-                for (const auto& it : selectedPartIds)
-                    emit this->setPartTarget(it, dust3d::PartTarget::CutFace);
-                emit this->groupOperationAdded();
-            });
-            m_contextMenu->addAction(convertToCutFaceAction);
-        }
-        if (addConvertToStitchingLineAction) {
-            connect(convertToStitchingLineAction, &QAction::triggered, this, [=]() {
-                for (const auto& it : selectedPartIds)
-                    emit this->setPartTarget(it, dust3d::PartTarget::StitchingLine);
-                emit this->groupOperationAdded();
-            });
-            m_contextMenu->addAction(convertToStitchingLineAction);
+            partRoleMenu->addAction(action);
         }
     }
 

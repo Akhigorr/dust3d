@@ -43,7 +43,8 @@ class AnimationManageWidget : public QWidget {
 public:
     explicit AnimationManageWidget(Document* document, QWidget* parent = nullptr);
     ~AnimationManageWidget();
-    void setWireframeVisible(bool visible);
+    void selectAnimationById(const dust3d::Uuid& animationId);
+    void setParameterSliderValue(const std::string& paramName, int sliderValue);
 
 public slots:
     void onResultRigChanged();
@@ -88,6 +89,7 @@ private:
     QCheckBox* m_hideBonesCheck = nullptr;
     QCheckBox* m_hidePartsCheck = nullptr;
     QCheckBox* m_hideWeightsCheck = nullptr;
+    QCheckBox* m_wireframeCheck = nullptr;
 
     // Sound controls
     QCheckBox* m_playSoundCheck = nullptr;

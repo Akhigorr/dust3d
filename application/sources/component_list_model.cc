@@ -131,12 +131,58 @@ QVariant ComponentListModel::data(const QModelIndex& index, int role) const
                 if (nullptr != part && dust3d::PartTarget::Model != part->target) {
                     QPixmap badgedPixmap(pixmap);
                     QPainter painter(&badgedPixmap);
-                    QString badgeText = dust3d::PartTarget::CutFace == part->target
-                        ? tr("Cut Face")
-                        : tr("Stitch");
-                    QColor badgeColor = dust3d::PartTarget::CutFace == part->target
-                        ? QColor(Theme::red.red(), Theme::red.green(), Theme::red.blue(), 210)
-                        : QColor(Theme::blue.red(), Theme::blue.green(), Theme::blue.blue(), 210);
+                    QString badgeText;
+                    QColor badgeColor;
+                    if (dust3d::PartTarget::CutFace == part->target) {
+                        badgeText = tr("Cut Face");
+                        badgeColor = QColor(Theme::red.red(), Theme::red.green(), Theme::red.blue(), 210);
+                    } else if (dust3d::PartTarget::ImportedModel == part->target) {
+                        badgeText = tr("Imported");
+                        badgeColor = QColor(Theme::green.red(), Theme::green.green(), Theme::green.blue(), 210);
+                    } else if (dust3d::PartTarget::StitchingLine == part->target) {
+                        // Compute sequence number among stitching line siblings
+                        int seqNum = 0, seqTotal = 0;
+                        const Document::Component* listingComp = m_document->findComponent(m_listingComponentId);
+                        if (listingComp) {
+                            for (const auto& sibId : listingComp->childrenIds) {
+                                const Document::Component* sib = m_document->findComponent(sibId);
+                                if (!sib)
+                                    continue;
+                                const Document::Part* sibPart = m_document->findPart(sib->linkToPartId);
+                                if (sibPart && dust3d::PartTarget::StitchingLine == sibPart->target) {
+                                    ++seqTotal;
+                                    if (sibId == component->id)
+                                        seqNum = seqTotal;
+                                }
+                            }
+                        }
+                        badgeText = tr("Stitching Line");
+                        badgeColor = QColor(Theme::blue.red(), Theme::blue.green(), Theme::blue.blue(), 210);
+                        // Draw sequence number in top-right corner
+                        if (seqTotal > 1 && seqNum > 0) {
+                            QString seqText = QString::number(seqNum);
+                            QFont seqFont = painter.font();
+                            seqFont.setPixelSize(QGuiApplication::font().pixelSize() * 0.7);
+                            seqFont.setBold(true);
+                            painter.setFont(seqFont);
+                            QFontMetrics seqFm(seqFont);
+                            int seqW = seqFm.horizontalAdvance(seqText) + 6;
+                            int seqH = seqFm.height() + 4;
+                            int logW = qRound(badgedPixmap.width() / badgedPixmap.devicePixelRatio());
+                            int sx = logW - seqW - 4;
+                            int sy = 4;
+                            painter.fillRect(sx, sy, seqW, seqH,
+                                QColor(Theme::blue.red(), Theme::blue.green(), Theme::blue.blue(), 220));
+                            painter.setPen(Qt::white);
+                            painter.drawText(sx + 3, sy + 2 + seqFm.ascent(), seqText);
+                        }
+                    } else if (dust3d::PartTarget::StitchingLoop == part->target) {
+                        badgeText = tr("Stitching Loop");
+                        badgeColor = QColor(Theme::blue.red(), Theme::blue.green(), Theme::blue.blue(), 210);
+                    } else {
+                        badgeText = tr("Unknown");
+                        badgeColor = QColor(128, 128, 128, 210);
+                    }
                     QFont font = painter.font();
                     font.setPixelSize(QGuiApplication::font().pixelSize() * 0.63);
                     font.setBold(true);
@@ -201,8 +247,18 @@ QStringList ComponentListModel::mimeTypes() const
 
 QMimeData* ComponentListModel::mimeData(const QModelIndexList& indexes) const
 {
-    // Use the default implementation from QAbstractListModel
-    return QAbstractListModel::mimeData(indexes);
+    QMimeData* data = QAbstractListModel::mimeData(indexes);
+    QByteArray encodedIds;
+    for (const auto& index : indexes) {
+        dust3d::Uuid componentId = modelIndexToComponentId(index);
+        if (!componentId.isNull()) {
+            if (!encodedIds.isEmpty())
+                encodedIds.append(';');
+            encodedIds.append(componentId.toString().c_str());
+        }
+    }
+    data->setData("application/x-dust3d-component-ids", encodedIds);
+    return data;
 }
 
 bool ComponentListModel::dropMimeData(const QMimeData* data, Qt::DropAction action, int /*row*/, int /*column*/, const QModelIndex& /*parent*/)
@@ -212,4 +268,56 @@ bool ComponentListModel::dropMimeData(const QMimeData* data, Qt::DropAction acti
 
     // Accept the drop - actual reordering is handled in the view's dropEvent
     return true;
+}
+
+bool ComponentListModel::hasUngroupedStitchingParts() const
+{
+    // Only relevant at root level
+    if (!m_listingComponentId.isNull())
+        return false;
+    const Document::Component* listingComponent = m_document->findComponent(m_listingComponentId);
+    if (!listingComponent)
+        return false;
+    for (const auto& childId : listingComponent->childrenIds) {
+        const Document::Component* child = m_document->findComponent(childId);
+        if (!child)
+            continue;
+        const Document::Part* part = m_document->findPart(child->linkToPartId);
+        if (part && (dust3d::PartTarget::StitchingLine == part->target || dust3d::PartTarget::StitchingLoop == part->target))
+            return true;
+    }
+    return false;
+}
+
+bool ComponentListModel::hasStitchingLoopInfo() const
+{
+    const Document::Component* listingComponent = m_document->findComponent(m_listingComponentId);
+    if (!listingComponent)
+        return false;
+    for (const auto& childId : listingComponent->childrenIds) {
+        const Document::Component* child = m_document->findComponent(childId);
+        if (!child)
+            continue;
+        const Document::Part* part = m_document->findPart(child->linkToPartId);
+        if (part && dust3d::PartTarget::StitchingLoop == part->target)
+            return true;
+    }
+    return false;
+}
+
+bool ComponentListModel::hasStitchingLineOrdering() const
+{
+    int count = 0;
+    const Document::Component* listingComponent = m_document->findComponent(m_listingComponentId);
+    if (!listingComponent)
+        return false;
+    for (const auto& childId : listingComponent->childrenIds) {
+        const Document::Component* child = m_document->findComponent(childId);
+        if (!child)
+            continue;
+        const Document::Part* part = m_document->findPart(child->linkToPartId);
+        if (part && dust3d::PartTarget::StitchingLine == part->target)
+            ++count;
+    }
+    return count > 1;
 }

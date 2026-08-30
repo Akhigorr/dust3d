@@ -1,4 +1,5 @@
 #include "bone_manage_widget.h"
+#include "bone_property_widget.h"
 #include "document.h"
 #include "model_mesh.h"
 #include "monochrome_mesh.h"
@@ -116,7 +117,19 @@ BoneManageWidget::BoneManageWidget(Document* document, QWidget* parent)
         m_rigTypeComboBox->addItem(entry.second.type);
     }
 
+    QPushButton* advancedButton = new QPushButton(Theme::awesome()->icon(fa::sliders), "");
+    Theme::initIconButton(advancedButton);
+    advancedButton->setToolTip(tr("Advanced..."));
+    connect(advancedButton, &QPushButton::clicked, this, [this]() {
+        BonePropertyWidget* widget = new BonePropertyWidget(m_document, this);
+        widget->setWindowFlags(Qt::Popup);
+        widget->setAttribute(Qt::WA_DeleteOnClose);
+        widget->move(QCursor::pos());
+        widget->show();
+    });
+
     rigTypeLayout->addWidget(m_rigTypeComboBox);
+    rigTypeLayout->addWidget(advancedButton);
     rigTypeLayout->addStretch();
 
     // Add to main layout
@@ -272,8 +285,12 @@ bool BoneManageWidget::eventFilter(QObject* watched, QEvent* event)
             if (m_skeletonGraphicsWidget) {
                 std::set<dust3d::Uuid> unassignedEdgeIds;
                 for (const auto& it : m_document->edgeMap) {
-                    if (it.second.boneName.isEmpty())
+                    if (it.second.boneName.isEmpty()) {
+                        auto partIt = m_document->partMap.find(it.second.partId);
+                        if (partIt != m_document->partMap.end() && dust3d::PartTarget::CutFace == partIt->second.target)
+                            continue;
                         unassignedEdgeIds.insert(it.first);
+                    }
                 }
                 m_skeletonGraphicsWidget->highlightEdges(unassignedEdgeIds);
             }
@@ -285,8 +302,12 @@ bool BoneManageWidget::eventFilter(QObject* watched, QEvent* event)
                 m_skeletonGraphicsWidget->clearEdgeHighlights();
                 m_skeletonGraphicsWidget->unselectAll();
                 for (const auto& it : m_document->edgeMap) {
-                    if (it.second.boneName.isEmpty())
+                    if (it.second.boneName.isEmpty()) {
+                        auto partIt = m_document->partMap.find(it.second.partId);
+                        if (partIt != m_document->partMap.end() && dust3d::PartTarget::CutFace == partIt->second.target)
+                            continue;
                         m_skeletonGraphicsWidget->addSelectEdgeOnSideProfile(it.first);
+                    }
                 }
             }
         }
@@ -540,6 +561,29 @@ void BoneManageWidget::selectBoneEdges()
     }
 }
 
+void BoneManageWidget::selectBoneByName(const QString& boneName)
+{
+    if (boneName.isEmpty())
+        return;
+    // Recursively search the tree model for the bone name
+    std::function<QModelIndex(QStandardItem*)> findBone = [&](QStandardItem* parent) -> QModelIndex {
+        for (int i = 0; i < parent->rowCount(); ++i) {
+            QStandardItem* child = parent->child(i);
+            if (child->data(BoneNameRole).toString() == boneName)
+                return m_boneTreeModel->indexFromItem(child);
+            QModelIndex result = findBone(child);
+            if (result.isValid())
+                return result;
+        }
+        return QModelIndex();
+    };
+    QModelIndex index = findBone(m_boneTreeModel->invisibleRootItem());
+    if (index.isValid()) {
+        m_boneTreeView->selectionModel()->select(index, QItemSelectionModel::ClearAndSelect);
+        m_boneTreeView->scrollTo(index);
+    }
+}
+
 void BoneManageWidget::updateBoneTreeView(const QString& rigType)
 {
     m_boneTreeModel->clear();
@@ -700,11 +744,15 @@ void BoneManageWidget::updateBoneTreeLabels()
 
 void BoneManageWidget::updateAssignProgressBar()
 {
-    int totalEdges = (int)m_document->edgeMap.size();
+    int totalEdges = 0;
     int assignedEdges = 0;
     for (const auto& it : m_document->edgeMap) {
+        auto partIt = m_document->partMap.find(it.second.partId);
+        if (partIt != m_document->partMap.end() && dust3d::PartTarget::CutFace == partIt->second.target)
+            continue;
+        ++totalEdges;
         if (!it.second.boneName.isEmpty())
-            assignedEdges++;
+            ++assignedEdges;
     }
 
     m_assignProgressBar->setMaximum(totalEdges);

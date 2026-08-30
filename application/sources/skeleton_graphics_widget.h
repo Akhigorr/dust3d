@@ -77,8 +77,10 @@ signals:
     void shortcutToggleWireframe();
     void partComponentChecked(dust3d::Uuid partId);
     void showOrHideAllComponents();
+    void showAllOrHideOtherComponents(dust3d::Uuid componentId);
     void shortcutToggleFlatShading();
     void shortcutToggleRotation();
+    void showComponentPropertyRequested(std::set<dust3d::Uuid> partIds);
     void loadedTurnaroundImageChanged();
     void nodePicked(const dust3d::Uuid& nodeId);
 
@@ -158,6 +160,10 @@ public slots:
     void flipVertically();
     void rotateClockwise90Degree();
     void rotateCounterclockwise90Degree();
+    void rotateSelectedAroundZAxis90Degree();
+    void rotateSelectedAroundZAxisMinus90Degree();
+    void rotateSelectedAroundXAxis90Degree();
+    void rotateSelectedAroundXAxisMinus90Degree();
     void rotateAllMainProfileClockwise90DegreeAlongOrigin();
     void rotateAllMainProfileCounterclockwise90DegreeAlongOrigin();
     void removeAllContent();
@@ -218,6 +224,7 @@ public slots:
     void shortcutScaleSelectedBy1();
     void shortcutSwitchProfileOnSelected();
     void shortcutShowOrHideSelectedPart();
+    void shortcutHideOtherParts();
     void shortcutEnableOrDisableSelectedPart();
     void shortcutLockOrUnlockSelectedPart();
     void shortcutXmirrorOnOrOffSelectedPart();
@@ -227,6 +234,7 @@ public slots:
     void shortcutChamferedOrNotSelectedPart();
     void shortcutSelectAll();
     void shortcutEscape();
+    void shortcutShowComponentProperty();
     void clearRangeSelection();
     void switchProfileOnRangeSelection();
 private slots:

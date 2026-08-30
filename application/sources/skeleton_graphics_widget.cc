@@ -163,6 +163,38 @@ void SkeletonGraphicsWidget::shortcutEscape()
     }
 }
 
+void SkeletonGraphicsWidget::shortcutShowComponentProperty()
+{
+    if (!isVisible())
+        return;
+
+    std::set<dust3d::Uuid> partIds;
+    for (const auto& item : m_rangeSelectionSet) {
+        if (item->data(0) == "node") {
+            const auto* node = m_document->findNode(((SkeletonGraphicsNodeItem*)item)->id());
+            if (nullptr != node)
+                partIds.insert(node->partId);
+        } else if (item->data(0) == "edge") {
+            const auto* edge = m_document->findEdge(((SkeletonGraphicsEdgeItem*)item)->id());
+            if (nullptr != edge)
+                partIds.insert(edge->partId);
+        }
+    }
+    if (nullptr != m_hoveredNodeItem) {
+        const auto* node = m_document->findNode(m_hoveredNodeItem->id());
+        if (nullptr != node)
+            partIds.insert(node->partId);
+    } else if (nullptr != m_hoveredEdgeItem) {
+        const auto* edge = m_document->findEdge(m_hoveredEdgeItem->id());
+        if (nullptr != edge)
+            partIds.insert(edge->partId);
+    }
+    if (partIds.empty())
+        return;
+
+    emit showComponentPropertyRequested(partIds);
+}
+
 void SkeletonGraphicsWidget::showContextMenu(const QPoint& pos)
 {
     if (Document::EditMode::Add == m_document->editMode) {
@@ -200,7 +232,7 @@ void SkeletonGraphicsWidget::showContextMenu(const QPoint& pos)
         m_contextMenu->addAction(deleteAction);
     }
 
-    QAction* breakAction = new QAction(tr("Break"), m_contextMenu.get());
+    QAction* breakAction = new QAction(tr("Split"), m_contextMenu.get());
     if (hasEdgeSelection()) {
         connect(breakAction, &QAction::triggered, this, &SkeletonGraphicsWidget::breakSelected);
         m_contextMenu->addAction(breakAction);
@@ -264,6 +296,37 @@ void SkeletonGraphicsWidget::showContextMenu(const QPoint& pos)
     if (hasMultipleSelection()) {
         connect(rotateCounterclockwiseAction, &QAction::triggered, this, &SkeletonGraphicsWidget::rotateCounterclockwise90Degree);
         m_contextMenu->addAction(rotateCounterclockwiseAction);
+    }
+
+    {
+        bool hasMainProfileNodes = false;
+        bool hasSideProfileNodes = false;
+        for (const auto& it : m_rangeSelectionSet) {
+            if (it->data(0) == "node") {
+                auto nodeItem = static_cast<SkeletonGraphicsNodeItem*>(it);
+                if (Document::Profile::Main == nodeItem->profile())
+                    hasMainProfileNodes = true;
+                else
+                    hasSideProfileNodes = true;
+            }
+        }
+        if (hasSideProfileNodes && !hasMainProfileNodes) {
+            QAction* rotateZAxisAction = new QAction(tr("Rotate 90D Around Z-Axis"), m_contextMenu.get());
+            connect(rotateZAxisAction, &QAction::triggered, this, &SkeletonGraphicsWidget::rotateSelectedAroundZAxis90Degree);
+            m_contextMenu->addAction(rotateZAxisAction);
+
+            QAction* rotateZAxisMinusAction = new QAction(tr("Rotate -90D Around Z-Axis"), m_contextMenu.get());
+            connect(rotateZAxisMinusAction, &QAction::triggered, this, &SkeletonGraphicsWidget::rotateSelectedAroundZAxisMinus90Degree);
+            m_contextMenu->addAction(rotateZAxisMinusAction);
+        } else if (hasMainProfileNodes && !hasSideProfileNodes) {
+            QAction* rotateXAxisAction = new QAction(tr("Rotate 90D Around X-Axis"), m_contextMenu.get());
+            connect(rotateXAxisAction, &QAction::triggered, this, &SkeletonGraphicsWidget::rotateSelectedAroundXAxis90Degree);
+            m_contextMenu->addAction(rotateXAxisAction);
+
+            QAction* rotateXAxisMinusAction = new QAction(tr("Rotate -90D Around X-Axis"), m_contextMenu.get());
+            connect(rotateXAxisMinusAction, &QAction::triggered, this, &SkeletonGraphicsWidget::rotateSelectedAroundXAxisMinus90Degree);
+            m_contextMenu->addAction(rotateXAxisMinusAction);
+        }
     }
 
     QAction* switchXzAction = new QAction(tr("Switch XZ"), m_contextMenu.get());
@@ -848,7 +911,7 @@ bool SkeletonGraphicsWidget::mouseMove(QMouseEvent* event)
     if (Document::EditMode::Select == m_document->editMode) {
         if (m_rangeSelectionStarted) {
             QPointF mouseScenePos = mouseEventScenePos(event);
-            m_selectionItem->updateRange(m_rangeSelectionStartPos, mouseScenePos);
+            m_selectionItem->addPoint(mouseScenePos);
             if (!m_selectionItem->isVisible())
                 m_selectionItem->setVisible(true);
             checkRangeSelection();
@@ -1270,7 +1333,7 @@ void SkeletonGraphicsWidget::scaleSelected(float delta)
 bool SkeletonGraphicsWidget::wheel(QWheelEvent* event)
 {
     float delta = 0;
-    if (event->pixelDelta().y() > 0)
+    if (event->angleDelta().y() > 0)
         delta = 1;
     else
         delta = -1;
@@ -1366,6 +1429,182 @@ void SkeletonGraphicsWidget::rotateCounterclockwise90Degree()
 {
     emit batchChangeBegin();
     emit rotateSelected(360 - 90);
+    emit batchChangeEnd();
+    emit groupOperationAdded();
+}
+
+void SkeletonGraphicsWidget::rotateSelectedAroundZAxis90Degree()
+{
+    if (m_rangeSelectionSet.empty())
+        return;
+    std::set<SkeletonGraphicsNodeItem*> nodeItems;
+    readMergedSkeletonNodeSetFromRangeSelection(&nodeItems);
+    if (nodeItems.empty())
+        return;
+
+    // Compute 3D centroid
+    float cx = 0, cy = 0, cz = 0;
+    int count = 0;
+    for (const auto& nodeItem : nodeItems) {
+        const Document::Node* node = m_document->findNode(nodeItem->id());
+        if (!node)
+            continue;
+        cx += node->getX();
+        cy += node->getY();
+        cz += node->getZ();
+        ++count;
+    }
+    if (count == 0)
+        return;
+    cx /= count;
+    cy /= count;
+    cz /= count;
+
+    // Rotate 90° around Z-axis: (x,y,z) -> (y, -x, z), relative to centroid
+    emit batchChangeBegin();
+    for (const auto& nodeItem : nodeItems) {
+        const Document::Node* node = m_document->findNode(nodeItem->id());
+        if (!node)
+            continue;
+        float rx = node->getX() - cx;
+        float ry = node->getY() - cy;
+        float newX = cx + ry;
+        float newY = cy + (-rx);
+        float newZ = node->getZ();
+        emit moveNodeBy(nodeItem->id(), newX - node->getX(), newY - node->getY(), newZ - node->getZ());
+    }
+    emit batchChangeEnd();
+    emit groupOperationAdded();
+}
+
+void SkeletonGraphicsWidget::rotateSelectedAroundZAxisMinus90Degree()
+{
+    if (m_rangeSelectionSet.empty())
+        return;
+    std::set<SkeletonGraphicsNodeItem*> nodeItems;
+    readMergedSkeletonNodeSetFromRangeSelection(&nodeItems);
+    if (nodeItems.empty())
+        return;
+
+    // Compute 3D centroid
+    float cx = 0, cy = 0, cz = 0;
+    int count = 0;
+    for (const auto& nodeItem : nodeItems) {
+        const Document::Node* node = m_document->findNode(nodeItem->id());
+        if (!node)
+            continue;
+        cx += node->getX();
+        cy += node->getY();
+        cz += node->getZ();
+        ++count;
+    }
+    if (count == 0)
+        return;
+    cx /= count;
+    cy /= count;
+    cz /= count;
+
+    // Rotate -90° around Z-axis: (x,y,z) -> (-y, x, z), relative to centroid
+    emit batchChangeBegin();
+    for (const auto& nodeItem : nodeItems) {
+        const Document::Node* node = m_document->findNode(nodeItem->id());
+        if (!node)
+            continue;
+        float rx = node->getX() - cx;
+        float ry = node->getY() - cy;
+        float newX = cx + (-ry);
+        float newY = cy + rx;
+        float newZ = node->getZ();
+        emit moveNodeBy(nodeItem->id(), newX - node->getX(), newY - node->getY(), newZ - node->getZ());
+    }
+    emit batchChangeEnd();
+    emit groupOperationAdded();
+}
+
+void SkeletonGraphicsWidget::rotateSelectedAroundXAxis90Degree()
+{
+    if (m_rangeSelectionSet.empty())
+        return;
+    std::set<SkeletonGraphicsNodeItem*> nodeItems;
+    readMergedSkeletonNodeSetFromRangeSelection(&nodeItems);
+    if (nodeItems.empty())
+        return;
+
+    // Compute 3D centroid
+    float cx = 0, cy = 0, cz = 0;
+    int count = 0;
+    for (const auto& nodeItem : nodeItems) {
+        const Document::Node* node = m_document->findNode(nodeItem->id());
+        if (!node)
+            continue;
+        cx += node->getX();
+        cy += node->getY();
+        cz += node->getZ();
+        ++count;
+    }
+    if (count == 0)
+        return;
+    cx /= count;
+    cy /= count;
+    cz /= count;
+
+    // Rotate 90° around X-axis: (x,y,z) -> (x, -z, y), relative to centroid
+    emit batchChangeBegin();
+    for (const auto& nodeItem : nodeItems) {
+        const Document::Node* node = m_document->findNode(nodeItem->id());
+        if (!node)
+            continue;
+        float ry = node->getY() - cy;
+        float rz = node->getZ() - cz;
+        float newX = node->getX();
+        float newY = cy + (-rz);
+        float newZ = cz + ry;
+        emit moveNodeBy(nodeItem->id(), newX - node->getX(), newY - node->getY(), newZ - node->getZ());
+    }
+    emit batchChangeEnd();
+    emit groupOperationAdded();
+}
+
+void SkeletonGraphicsWidget::rotateSelectedAroundXAxisMinus90Degree()
+{
+    if (m_rangeSelectionSet.empty())
+        return;
+    std::set<SkeletonGraphicsNodeItem*> nodeItems;
+    readMergedSkeletonNodeSetFromRangeSelection(&nodeItems);
+    if (nodeItems.empty())
+        return;
+
+    // Compute 3D centroid
+    float cx = 0, cy = 0, cz = 0;
+    int count = 0;
+    for (const auto& nodeItem : nodeItems) {
+        const Document::Node* node = m_document->findNode(nodeItem->id());
+        if (!node)
+            continue;
+        cx += node->getX();
+        cy += node->getY();
+        cz += node->getZ();
+        ++count;
+    }
+    if (count == 0)
+        return;
+    cx /= count;
+    cy /= count;
+    cz /= count;
+
+    // Rotate -90° around X-axis: (x,y,z) -> (x, z, -y), relative to centroid
+    emit batchChangeBegin();
+    for (const auto& nodeItem : nodeItems) {
+        const Document::Node* node = m_document->findNode(nodeItem->id());
+        if (!node)
+            continue;
+        float ry = node->getY() - cy;
+        float rz = node->getZ() - cz;
+        float newX = node->getX();
+        float newY = cy + rz;
+        float newZ = cz + (-ry);
+        emit moveNodeBy(nodeItem->id(), newX - node->getX(), newY - node->getY(), newZ - node->getZ());
+    }
     emit batchChangeEnd();
     emit groupOperationAdded();
 }
@@ -1535,6 +1774,7 @@ bool SkeletonGraphicsWidget::mousePress(QMouseEvent* event)
         if (Document::EditMode::Select == m_document->editMode) {
             if (!m_rangeSelectionStarted) {
                 m_rangeSelectionStartPos = mouseEventScenePos(event);
+                m_selectionItem->reset(m_rangeSelectionStartPos);
                 m_rangeSelectionStarted = true;
             }
         }
@@ -1954,6 +2194,22 @@ void SkeletonGraphicsWidget::shortcutShowOrHideSelectedPart()
             emit groupOperationAdded();
         } else {
             emit showOrHideAllComponents();
+        }
+    }
+}
+
+void SkeletonGraphicsWidget::shortcutHideOtherParts()
+{
+    if (!isVisible())
+        return;
+
+    if (Document::EditMode::Select == m_document->editMode) {
+        if (!m_lastCheckedPart.isNull()) {
+            const Document::Part* part = m_document->findPart(m_lastCheckedPart);
+            if (part) {
+                emit showAllOrHideOtherComponents(part->componentId);
+                emit groupOperationAdded();
+            }
         }
     }
 }
@@ -2416,7 +2672,7 @@ void SkeletonGraphicsWidget::checkRangeSelection()
         choosenProfile = readSkeletonItemProfile(*it);
     }
     if (m_selectionItem->isVisible()) {
-        QList<QGraphicsItem*> items = scene()->items(m_selectionItem->sceneBoundingRect());
+        QList<QGraphicsItem*> items = scene()->items(m_selectionItem->selectionShape(), Qt::IntersectsItemShape);
         for (auto it = items.begin(); it != items.end(); it++) {
             QGraphicsItem* item = *it;
             if (QGuiApplication::queryKeyboardModifiers().testFlag(Qt::AltModifier)) {

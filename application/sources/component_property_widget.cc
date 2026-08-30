@@ -2,14 +2,18 @@
 #include "cut_face_preview.h"
 #include "float_number_widget.h"
 #include "flow_layout.h"
+#include "glb_forever.h"
 #include "image_forever.h"
 #include "image_preview_widget.h"
 #include "theme.h"
 #include <QColorDialog>
 #include <QComboBox>
+#include <QFile>
 #include <QFileDialog>
+#include <QGraphicsOpacityEffect>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QMenu>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QVBoxLayout>
@@ -80,56 +84,74 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
     }
 
     topLayout->addStretch();
-    if (nullptr != combineModeSelectBox)
+    if (nullptr != combineModeSelectBox && !(nullptr != m_part && dust3d::PartTarget::CutFace == m_part->target))
         topLayout->addWidget(combineModeSelectBox);
     topLayout->setSizeConstraint(QLayout::SetFixedSize);
 
     QGroupBox* partRoleGroupBox = nullptr;
     if (nullptr != m_part) {
-        QPushButton* modelRoleButton = new QPushButton(tr("Model"));
-        QPushButton* cutFaceRoleButton = new QPushButton(tr("Cut Face"));
-        QPushButton* stitchingLineRoleButton = new QPushButton(tr("Stitching Line"));
-        modelRoleButton->setToolTip(tr("Regular mesh part — contributes geometry to the 3D model"));
-        cutFaceRoleButton->setToolTip(tr("Cross-section profile — defines the tube shape that Model parts can reference as their cut face"));
-        stitchingLineRoleButton->setToolTip(tr("Stitch guide — stitches surface geometry across lines within the same component"));
-        auto initRoleButton = [](QPushButton* btn, bool selected) {
-            btn->setFlat(selected);
-            btn->setEnabled(!selected);
-        };
-        initRoleButton(modelRoleButton, dust3d::PartTarget::Model == m_part->target);
-        initRoleButton(cutFaceRoleButton, dust3d::PartTarget::CutFace == m_part->target);
-        initRoleButton(stitchingLineRoleButton, dust3d::PartTarget::StitchingLine == m_part->target);
-        connect(modelRoleButton, &QPushButton::clicked, this, [=]() {
-            initRoleButton(modelRoleButton, true);
-            initRoleButton(cutFaceRoleButton, false);
-            initRoleButton(stitchingLineRoleButton, false);
-            emit setPartTarget(m_partId, dust3d::PartTarget::Model);
+        QComboBox* partRoleComboBox = new QComboBox;
+        partRoleComboBox->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+        partRoleComboBox->addItem(tr("Model"), static_cast<int>(dust3d::PartTarget::Model));
+        partRoleComboBox->addItem(tr("Cut Face"), static_cast<int>(dust3d::PartTarget::CutFace));
+        partRoleComboBox->addItem(tr("Stitching Line"), static_cast<int>(dust3d::PartTarget::StitchingLine));
+        partRoleComboBox->addItem(tr("Stitching Loop"), static_cast<int>(dust3d::PartTarget::StitchingLoop));
+        partRoleComboBox->addItem(tr("Imported Model"), static_cast<int>(dust3d::PartTarget::ImportedModel));
+        partRoleComboBox->setCurrentIndex(static_cast<int>(m_part->target));
+        connect(partRoleComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [=](int index) {
+            emit setPartTarget(m_partId, static_cast<dust3d::PartTarget>(partRoleComboBox->itemData(index).toInt()));
             emit groupOperationAdded();
-        });
-        connect(cutFaceRoleButton, &QPushButton::clicked, this, [=]() {
-            initRoleButton(modelRoleButton, false);
-            initRoleButton(cutFaceRoleButton, true);
-            initRoleButton(stitchingLineRoleButton, false);
-            emit setPartTarget(m_partId, dust3d::PartTarget::CutFace);
-            emit groupOperationAdded();
-        });
-        connect(stitchingLineRoleButton, &QPushButton::clicked, this, [=]() {
-            initRoleButton(modelRoleButton, false);
-            initRoleButton(cutFaceRoleButton, false);
-            initRoleButton(stitchingLineRoleButton, true);
-            emit setPartTarget(m_partId, dust3d::PartTarget::StitchingLine);
-            emit groupOperationAdded();
+            QWidget* widget = this;
+            while (nullptr != widget) {
+                QMenu* menu = qobject_cast<QMenu*>(widget);
+                if (nullptr != menu) {
+                    menu->close();
+                    break;
+                }
+                widget = widget->parentWidget();
+            }
         });
         QHBoxLayout* partRoleLayout = new QHBoxLayout;
-        partRoleLayout->addWidget(modelRoleButton);
-        partRoleLayout->addWidget(cutFaceRoleButton);
-        partRoleLayout->addWidget(stitchingLineRoleButton);
+        partRoleLayout->addWidget(partRoleComboBox);
+        partRoleLayout->addStretch();
+
+        QVBoxLayout* partRoleVLayout = new QVBoxLayout;
+        partRoleVLayout->addLayout(partRoleLayout);
+
+        if (dust3d::PartTarget::CutFace == m_part->target) {
+            size_t usageCount = 0;
+            std::string cutFacePartIdString = m_partId.toString();
+            for (const auto& it : m_document->partMap) {
+                if (it.second.cutFace == dust3d::CutFace::UserDefined
+                    && it.second.cutFaceLinkedId.toString() == cutFacePartIdString) {
+                    ++usageCount;
+                }
+                for (const auto& nodeId : it.second.nodeIds) {
+                    const Document::Node* node = m_document->findNode(nodeId);
+                    if (nullptr != node && node->hasCutFaceSettings
+                        && node->cutFace == dust3d::CutFace::UserDefined
+                        && node->cutFaceLinkedId.toString() == cutFacePartIdString) {
+                        ++usageCount;
+                    }
+                }
+            }
+            QLabel* usageLabel = new QLabel;
+            if (0 == usageCount)
+                usageLabel->setText(tr("Not used by any part"));
+            else if (1 == usageCount)
+                usageLabel->setText(tr("Used by 1 part"));
+            else
+                usageLabel->setText(tr("Used by %1 parts").arg(usageCount));
+            usageLabel->setStyleSheet("color: gray; font-style: italic;");
+            partRoleVLayout->addWidget(usageLabel);
+        }
+
         partRoleGroupBox = new QGroupBox(tr("Part Role"));
-        partRoleGroupBox->setLayout(partRoleLayout);
+        partRoleGroupBox->setLayout(partRoleVLayout);
     }
 
     QGroupBox* deformGroupBox = nullptr;
-    if (nullptr != m_part && dust3d::PartTarget::Model == m_part->target) {
+    if (nullptr != m_part && (dust3d::PartTarget::Model == m_part->target || dust3d::PartTarget::ImportedModel == m_part->target)) {
         FloatNumberWidget* thicknessWidget = new FloatNumberWidget;
         thicknessWidget->setItemName(tr("Thickness"));
         thicknessWidget->setRange(0, 2);
@@ -198,7 +220,8 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
         QHBoxLayout* deformUnifyLayout = new QHBoxLayout;
         deformUnifyLayout->addStretch();
         deformUnifyLayout->addWidget(mirrorStateBox);
-        deformUnifyLayout->addWidget(deformUnifyStateBox);
+        if (dust3d::PartTarget::Model == m_part->target)
+            deformUnifyLayout->addWidget(deformUnifyStateBox);
 
         deformLayout->addLayout(thicknessLayout);
         deformLayout->addLayout(widthLayout);
@@ -342,7 +365,7 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
     }
 
     QGroupBox* smoothGroupBox = nullptr;
-    if (!m_componentIds.empty()) {
+    if (!m_componentIds.empty() && !(nullptr != m_part && dust3d::PartTarget::CutFace == m_part->target)) {
         FloatNumberWidget* smoothCutoffDegreesWidget = new FloatNumberWidget;
         smoothCutoffDegreesWidget->setItemName(tr("Cutoff"));
         smoothCutoffDegreesWidget->setRange(0.0, 180.0);
@@ -374,7 +397,7 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
     }
 
     QGroupBox* colorImageGroupBox = nullptr;
-    if (!m_componentIds.empty()) {
+    if (!m_componentIds.empty() && !(nullptr != m_part && (dust3d::PartTarget::ImportedModel == m_part->target || dust3d::PartTarget::CutFace == m_part->target))) {
         ImagePreviewWidget* colorImagePreviewWidget = new ImagePreviewWidget;
         colorImagePreviewWidget->setFixedSize(Theme::partPreviewImageSize * 2, Theme::partPreviewImageSize * 2);
         auto colorImageId = lastColorImageId();
@@ -388,6 +411,7 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
         connect(colorImageEraser, &QPushButton::clicked, [=]() {
             for (const auto& componentId : m_componentIds)
                 emit setComponentColorImage(componentId, dust3d::Uuid());
+            colorImagePreviewWidget->updateImage(QImage());
             emit groupOperationAdded();
         });
 
@@ -489,10 +513,146 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
         stitchingLineGroupBox->setLayout(stitchingLineLayout);
     }
 
+    QGroupBox* stitchingLoopGroupBox = nullptr;
+    if (!m_componentIds.empty() && (hasStitchingLoopConfigure() || (nullptr != m_part && dust3d::PartTarget::StitchingLoop == m_part->target))) {
+        QVBoxLayout* stitchingLoopLayout = new QVBoxLayout;
+
+        if (nullptr == m_part) {
+            QCheckBox* loopBackCloseStateBox = new QCheckBox();
+            Theme::initCheckbox(loopBackCloseStateBox);
+            loopBackCloseStateBox->setText(tr("Back Closed"));
+            loopBackCloseStateBox->setToolTip(tr("Requires side profile facing left for correct cap normal"));
+            loopBackCloseStateBox->setChecked(lastBackClosed());
+
+            FloatNumberWidget* depthRatioWidget = new FloatNumberWidget;
+            depthRatioWidget->setItemName(tr("Depth"));
+            depthRatioWidget->setRange(0.0, 2.0);
+            depthRatioWidget->setValue(lastBackCloseDepthRatio());
+
+            FloatNumberWidget* sharpnessWidget = new FloatNumberWidget;
+            sharpnessWidget->setItemName(tr("Shape"));
+            sharpnessWidget->setRange(0.0, 1.0);
+            sharpnessWidget->setValue(lastBackCloseSharpness());
+
+            QWidget* backCloseParamsWidget = new QWidget;
+            QVBoxLayout* backCloseParamsLayout = new QVBoxLayout;
+            backCloseParamsLayout->setContentsMargins(0, 0, 0, 0);
+
+            QHBoxLayout* depthLayout = new QHBoxLayout;
+            depthLayout->addWidget(depthRatioWidget);
+            backCloseParamsLayout->addLayout(depthLayout);
+
+            QHBoxLayout* sharpnessLayout = new QHBoxLayout;
+            sharpnessLayout->addWidget(sharpnessWidget);
+            backCloseParamsLayout->addLayout(sharpnessLayout);
+
+            backCloseParamsWidget->setLayout(backCloseParamsLayout);
+            bool initiallyEnabled = loopBackCloseStateBox->isChecked();
+            backCloseParamsWidget->setEnabled(initiallyEnabled);
+            auto* opacityEffect = new QGraphicsOpacityEffect(backCloseParamsWidget);
+            opacityEffect->setOpacity(initiallyEnabled ? 1.0 : 0.35);
+            backCloseParamsWidget->setGraphicsEffect(opacityEffect);
+
+            connect(loopBackCloseStateBox, checkboxStateChangedSignal, this, [=]() {
+                bool closed = loopBackCloseStateBox->isChecked();
+                backCloseParamsWidget->setEnabled(closed);
+                opacityEffect->setOpacity(closed ? 1.0 : 0.35);
+                for (const auto& componentId : m_componentIds)
+                    emit setComponentBackCloseState(componentId, closed);
+                emit groupOperationAdded();
+            });
+
+            connect(depthRatioWidget, &FloatNumberWidget::valueChanged, [=](float value) {
+                for (const auto& componentId : m_componentIds)
+                    emit setComponentBackCloseDepthRatio(componentId, value);
+                emit groupOperationAdded();
+            });
+
+            connect(sharpnessWidget, &FloatNumberWidget::valueChanged, [=](float value) {
+                for (const auto& componentId : m_componentIds)
+                    emit setComponentBackCloseSharpness(componentId, value);
+                emit groupOperationAdded();
+            });
+
+            QHBoxLayout* loopOptionsLayout = new QHBoxLayout;
+            loopOptionsLayout->addStretch();
+            loopOptionsLayout->addWidget(loopBackCloseStateBox);
+            stitchingLoopLayout->addLayout(loopOptionsLayout);
+            stitchingLoopLayout->addWidget(backCloseParamsWidget);
+        }
+
+        if (nullptr != m_part && dust3d::PartTarget::StitchingLoop == m_part->target) {
+            QCheckBox* fillLoopInteriorBox = new QCheckBox();
+            Theme::initCheckbox(fillLoopInteriorBox);
+            fillLoopInteriorBox->setText(tr("Fill Loop Interior"));
+            fillLoopInteriorBox->setChecked(m_part->fillLoopInterior);
+            connect(fillLoopInteriorBox, checkboxStateChangedSignal, this, [=]() {
+                emit setPartFillLoopInteriorState(m_partId, fillLoopInteriorBox->isChecked());
+                emit groupOperationAdded();
+            });
+            QHBoxLayout* fillLayout = new QHBoxLayout;
+            fillLayout->addStretch();
+            fillLayout->addWidget(fillLoopInteriorBox);
+            stitchingLoopLayout->addLayout(fillLayout);
+        }
+
+        stitchingLoopGroupBox = new QGroupBox(tr("Stitching Loop"));
+        stitchingLoopGroupBox->setLayout(stitchingLoopLayout);
+    }
+
+    QGroupBox* importedModelGroupBox = nullptr;
+    if (nullptr != m_part && dust3d::PartTarget::ImportedModel == m_part->target) {
+        QPushButton* importGlbButton = new QPushButton(tr("Import GLB File..."));
+        importGlbButton->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
+        connect(importGlbButton, &QPushButton::clicked, this, [=]() {
+            QString filename = QFileDialog::getOpenFileName(this, tr("Import GLB File"), QString(), tr("GLB Files (*.glb)"));
+            if (filename.isEmpty())
+                return;
+            QFile file(filename);
+            if (!file.open(QIODevice::ReadOnly))
+                return;
+            QByteArray glbData = file.readAll();
+            dust3d::Uuid glbId = GlbForever::add(&glbData);
+            if (glbId.isNull())
+                return;
+            m_document->setPartImportedModelId(m_partId, glbId);
+            m_document->saveSnapshot();
+        });
+        FloatNumberWidget* importedModelRotationWidget = new FloatNumberWidget;
+        importedModelRotationWidget->setItemName(tr("Rotation"));
+        importedModelRotationWidget->setRange(-1, 1);
+        importedModelRotationWidget->setValue(m_part->cutRotation);
+
+        connect(importedModelRotationWidget, &FloatNumberWidget::valueChanged, [=](float value) {
+            emit setPartCutRotation(m_partId, value);
+            emit groupOperationAdded();
+        });
+
+        QPushButton* importedModelRotationEraser = new QPushButton(Theme::awesome()->icon(fa::eraser), "");
+        Theme::initIconButton(importedModelRotationEraser);
+
+        connect(importedModelRotationEraser, &QPushButton::clicked, [=]() {
+            importedModelRotationWidget->setValue(0.0);
+            emit groupOperationAdded();
+        });
+
+        QHBoxLayout* importedModelRotationLayout = new QHBoxLayout;
+        importedModelRotationLayout->addWidget(importedModelRotationEraser);
+        importedModelRotationLayout->addWidget(importedModelRotationWidget);
+
+        QVBoxLayout* importedModelLayout = new QVBoxLayout;
+        importedModelLayout->addWidget(importGlbButton);
+        importedModelLayout->addLayout(importedModelRotationLayout);
+        importedModelGroupBox = new QGroupBox(tr("Imported Model"));
+        importedModelGroupBox->setLayout(importedModelLayout);
+    }
+
     QVBoxLayout* mainLayout = new QVBoxLayout;
     mainLayout->addLayout(topLayout);
     if (nullptr != partRoleGroupBox)
         mainLayout->addWidget(partRoleGroupBox);
+    if (nullptr != importedModelGroupBox)
+        mainLayout->addWidget(importedModelGroupBox);
     if (nullptr != deformGroupBox)
         mainLayout->addWidget(deformGroupBox);
     if (nullptr != cutFaceGroupBox)
@@ -502,6 +662,8 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
     mainLayout->addLayout(skinLayout);
     if (nullptr != stitchingLineGroupBox)
         mainLayout->addWidget(stitchingLineGroupBox);
+    if (nullptr != stitchingLoopGroupBox)
+        mainLayout->addWidget(stitchingLoopGroupBox);
     mainLayout->setSizeConstraint(QLayout::SetFixedSize);
 
     connect(this, &ComponentPropertyWidget::setComponentColorState, m_document, &Document::setComponentColorState);
@@ -518,6 +680,9 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
     connect(this, &ComponentPropertyWidget::setComponentSideCloseState, m_document, &Document::setComponentSideCloseState);
     connect(this, &ComponentPropertyWidget::setComponentFrontCloseState, m_document, &Document::setComponentFrontCloseState);
     connect(this, &ComponentPropertyWidget::setComponentBackCloseState, m_document, &Document::setComponentBackCloseState);
+    connect(this, &ComponentPropertyWidget::setComponentBackCloseDepthRatio, m_document, &Document::setComponentBackCloseDepthRatio);
+    connect(this, &ComponentPropertyWidget::setComponentBackCloseSharpness, m_document, &Document::setComponentBackCloseSharpness);
+    connect(this, &ComponentPropertyWidget::setPartFillLoopInteriorState, m_document, &Document::setPartFillLoopInteriorState);
     connect(this, &ComponentPropertyWidget::setComponentTargetSegments, m_document, &Document::setComponentTargetSegments);
     connect(this, &ComponentPropertyWidget::setComponentSmoothCutoffDegrees, m_document, &Document::setComponentSmoothCutoffDegrees);
     connect(this, &ComponentPropertyWidget::setPartCutFace, m_document, &Document::setPartCutFace);
@@ -549,7 +714,7 @@ void ComponentPropertyWidget::updateCutFaceButtonState(size_t index)
 void ComponentPropertyWidget::pickColorImageForComponents(const std::vector<dust3d::Uuid>& componentIds)
 {
 #if defined(Q_OS_WASM)
-    QFileDialog::getOpenFileContent(tr("Image Files (*.png *.jpg *.bmp)"),
+    QFileDialog::getOpenFileContent(tr("Image Files (*.png *.jpg *.jpeg *.bmp)"),
         [=](const QString& fileName, const QByteArray& fileContent) {
             if (fileName.isEmpty())
                 return;
@@ -566,7 +731,7 @@ void ComponentPropertyWidget::pickColorImageForComponents(const std::vector<dust
         });
 #else
     QString fileName = QFileDialog::getOpenFileName(this, QString(), QString(),
-        tr("Image Files (*.png *.jpg *.bmp)"))
+        tr("Image Files (*.png *.jpg *.jpeg *.bmp)"))
                            .trimmed();
     if (fileName.isEmpty())
         return;
@@ -695,6 +860,32 @@ bool ComponentPropertyWidget::lastBackClosed()
     return closed;
 }
 
+float ComponentPropertyWidget::lastBackCloseDepthRatio()
+{
+    float value = 1.0f;
+    for (const auto& componentId : m_componentIds) {
+        const Document::Component* component = m_document->findComponent(componentId);
+        if (nullptr == component)
+            continue;
+        value = component->backCloseDepthRatio;
+        break;
+    }
+    return value;
+}
+
+float ComponentPropertyWidget::lastBackCloseSharpness()
+{
+    float value = 0.0f;
+    for (const auto& componentId : m_componentIds) {
+        const Document::Component* component = m_document->findComponent(componentId);
+        if (nullptr == component)
+            continue;
+        value = component->backCloseSharpness;
+        break;
+    }
+    return value;
+}
+
 dust3d::Uuid ComponentPropertyWidget::lastColorImageId()
 {
     dust3d::Uuid colorImageId;
@@ -785,7 +976,25 @@ bool ComponentPropertyWidget::hasStitchingLineConfigure()
                 const Document::Component* child = m_document->findComponent(childId);
                 if (nullptr != child) {
                     const Document::Part* part = m_document->findPart(child->linkToPartId);
-                    if (dust3d::PartTarget::StitchingLine == part->target)
+                    if (nullptr != part && dust3d::PartTarget::StitchingLine == part->target)
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool ComponentPropertyWidget::hasStitchingLoopConfigure()
+{
+    for (const auto& componentId : m_componentIds) {
+        const Document::Component* component = m_document->findComponent(componentId);
+        if (nullptr != component) {
+            for (const auto& childId : component->childrenIds) {
+                const Document::Component* child = m_document->findComponent(childId);
+                if (nullptr != child) {
+                    const Document::Part* part = m_document->findPart(child->linkToPartId);
+                    if (nullptr != part && dust3d::PartTarget::StitchingLoop == part->target)
                         return true;
                 }
             }

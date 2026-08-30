@@ -29,6 +29,8 @@
 #include <dust3d/mesh/mesh_recombiner.h>
 #include <dust3d/mesh/rope_mesh.h>
 #include <dust3d/mesh/smooth_normal.h>
+#include <dust3d/mesh/spine_deformer.h>
+#include <dust3d/mesh/stitch_loop_mesh_builder.h>
 #include <dust3d/mesh/stitch_mesh_builder.h>
 #include <dust3d/mesh/triangulate.h>
 #include <dust3d/mesh/trim_vertices.h>
@@ -61,6 +63,11 @@ void MeshGenerator::setId(uint64_t id)
 uint64_t MeshGenerator::id()
 {
     return m_id;
+}
+
+void MeshGenerator::setImportedModelData(std::map<std::string, ImportedModelData>&& importedModelData)
+{
+    m_importedModelData = std::move(importedModelData);
 }
 
 bool MeshGenerator::isSuccessful()
@@ -486,6 +493,7 @@ std::unique_ptr<MeshState> MeshGenerator::combineStitchingMesh(const std::string
     std::vector<Uuid> componentIds(componentIdStrings.size());
     for (size_t i = 0; i < componentIdStrings.size(); ++i)
         componentIds[i] = componentIdStrings[i];
+    std::map<Uuid, Color> splineColors;
     for (size_t partIndex = 0; partIndex < partIdStrings.size(); ++partIndex) {
         const auto& partIdString = partIdStrings[partIndex];
         auto findPart = m_snapshot->parts.find(partIdString);
@@ -505,6 +513,14 @@ std::unique_ptr<MeshState> MeshGenerator::combineStitchingMesh(const std::string
             componentCache.nodeMap.emplace(std::make_pair(meshNode.sourceId,
                 ObjectNode { meshNode.origin, color, smoothCutoffDegrees }));
         }
+        Color splineColor = color;
+        auto findComponent = m_snapshot->components.find(componentIdStrings[partIndex]);
+        if (findComponent != m_snapshot->components.end()) {
+            std::string componentColorString = String::valueOrEmpty(findComponent->second, "color");
+            if (!componentColorString.empty())
+                splineColor = Color(componentColorString);
+        }
+        splineColors[componentIds[partIndex]] = splineColor;
         splines.emplace_back(StitchMeshBuilder::Spline {
             std::move(orderedBuilderNodes),
             componentIds[partIndex] });
@@ -559,6 +575,7 @@ std::unique_ptr<MeshState> MeshGenerator::combineStitchingMesh(const std::string
     // Generate preview for each stitching line
     for (const auto& spline : stitchMeshBuilder->splines()) {
         RopeMesh::BuildParameters buildParameters;
+        buildParameters.defaultRadius = 0.006;
         RopeMesh ropeMesh(buildParameters);
         std::vector<Vector3> positions(spline.nodes.size());
         for (size_t i = 0; i < spline.nodes.size(); ++i)
@@ -570,7 +587,7 @@ std::unique_ptr<MeshState> MeshGenerator::combineStitchingMesh(const std::string
             mesh->fetch(stitchingLinePreview.vertices, stitchingLinePreview.triangles);
         size_t startIndex = stitchingLinePreview.vertices.size();
 
-        stitchingLinePreview.color = Color(color[0], color[1], color[2], 0.5);
+        stitchingLinePreview.color = Color(color[0], color[1], color[2], 0.15);
         for (const auto& ropeVertex : ropeMesh.resultVertices()) {
             stitchingLinePreview.vertices.emplace_back(ropeVertex);
         }
@@ -580,8 +597,10 @@ std::unique_ptr<MeshState> MeshGenerator::combineStitchingMesh(const std::string
             stitchingLinePreview.metalness,
             stitchingLinePreview.roughness
         };
+        auto findSplineColor = splineColors.find(spline.sourceId);
+        Color ropeColor = (findSplineColor != splineColors.end()) ? findSplineColor->second : color;
         auto lineProperty = std::tuple<dust3d::Color, float /*metalness*/, float /*roughness*/> {
-            Color(1.0, 1.0, 1.0, 1.0),
+            Color(ropeColor.r(), ropeColor.g(), ropeColor.b(), 1.0),
             stitchingLinePreview.metalness,
             stitchingLinePreview.roughness
         };
@@ -598,6 +617,175 @@ std::unique_ptr<MeshState> MeshGenerator::combineStitchingMesh(const std::string
                 startIndex + ropeTriangles[2] });
         }
         addComponentPreview(spline.sourceId, ComponentPreview(stitchingLinePreview));
+    }
+
+    return mesh;
+}
+
+std::unique_ptr<MeshState> MeshGenerator::combineStitchingLoopMesh(const std::string& componentIdString,
+    const std::vector<std::string>& partIdStrings,
+    const std::vector<std::string>& componentIdStrings,
+    bool backClosed,
+    float backCloseDepthRatio,
+    float backCloseSharpness,
+    size_t targetSegments,
+    Color color,
+    float smoothCutoffDegrees,
+    GeneratedComponent& componentCache)
+{
+    std::vector<StitchLoopMeshBuilder::Loop> loops;
+    loops.reserve(partIdStrings.size());
+    std::vector<Uuid> componentIds(componentIdStrings.size());
+    for (size_t i = 0; i < componentIdStrings.size(); ++i)
+        componentIds[i] = componentIdStrings[i];
+    std::map<Uuid, Color> loopPartColors;
+    for (size_t partIndex = 0; partIndex < partIdStrings.size(); ++partIndex) {
+        const auto& partIdString = partIdStrings[partIndex];
+        auto findPart = m_snapshot->parts.find(partIdString);
+        Color partColor = color;
+        if (findPart != m_snapshot->parts.end()) {
+            if (String::isTrue(String::valueOrEmpty(findPart->second, "disabled")))
+                continue;
+            std::string partColorString = String::valueOrEmpty(findPart->second, "color");
+            if (!partColorString.empty())
+                partColor = Color(partColorString);
+        }
+        bool isCircle = false;
+        std::vector<MeshNode> orderedBuilderNodes;
+        if (!fetchPartOrderedNodes(partIdString, false, &orderedBuilderNodes, &isCircle))
+            continue;
+        if (orderedBuilderNodes.size() < 2)
+            continue;
+        for (const auto& meshNode : orderedBuilderNodes) {
+            componentCache.nodeMap.emplace(std::make_pair(meshNode.sourceId,
+                ObjectNode { meshNode.origin, partColor, smoothCutoffDegrees }));
+        }
+        Color loopColor = color;
+        auto findComponent = m_snapshot->components.find(componentIdStrings[partIndex]);
+        if (findComponent != m_snapshot->components.end()) {
+            std::string componentColorString = String::valueOrEmpty(findComponent->second, "color");
+            if (!componentColorString.empty())
+                loopColor = Color(componentColorString);
+        }
+        loopPartColors[componentIds[partIndex]] = loopColor;
+        StitchLoopMeshBuilder::Loop loop;
+        loop.nodes = std::move(orderedBuilderNodes);
+        loop.sourceId = componentIds[partIndex];
+        loop.closed = isCircle;
+        if (findPart != m_snapshot->parts.end())
+            loop.fillInterior = String::isTrue(String::valueOrEmpty(findPart->second, "fillLoopInterior"));
+        loops.emplace_back(std::move(loop));
+    }
+
+    auto loopMeshBuilder = std::make_unique<StitchLoopMeshBuilder>(std::move(loops), targetSegments);
+    loopMeshBuilder->setBackClosed(backClosed);
+    loopMeshBuilder->setBackCloseDepthRatio(backCloseDepthRatio);
+    loopMeshBuilder->setBackCloseSharpness(backCloseSharpness);
+    loopMeshBuilder->build();
+
+    const auto& generatedVertices = loopMeshBuilder->generatedVertices();
+    const auto& generatedFaces = loopMeshBuilder->generatedFaces();
+
+    collectSharedQuadEdges(generatedVertices, generatedFaces, &componentCache.sharedQuadEdges);
+
+    auto mesh = std::make_unique<MeshState>(generatedVertices, generatedFaces);
+    if (mesh && mesh->isNull())
+        mesh.reset();
+
+    const auto& faceUvs = loopMeshBuilder->generatedFaceUvs();
+    Uuid componentId = Uuid(componentIdString);
+
+    // Determine whether the component has a texture image configured.
+    // If yes: use a single chart keyed by componentId with the 2D-projection UVs so the
+    //         texture image is mapped onto the whole mesh.
+    // If no:  split faces into per-part sub-charts keyed by each loop's sourceId (which is
+    //         a child component ID in the snapshot). Each sub-chart uses that part's color
+    //         (or its own colorImageId if configured), painted as a solid fill or textured tile.
+    bool componentHasImage = false;
+    {
+        auto findComp = m_snapshot->components.find(componentIdString);
+        if (findComp != m_snapshot->components.end())
+            componentHasImage = !String::valueOrEmpty(findComp->second, "colorImageId").empty();
+    }
+
+    auto insertTriangleUv = [&](std::map<std::array<PositionKey, 3>, std::array<Vector2, 3>>& uvMap,
+                                const std::vector<size_t>& face, const std::vector<Vector2>& uv) {
+        if (3 == face.size()) {
+            uvMap.insert({ { PositionKey(generatedVertices[face[0]]),
+                               PositionKey(generatedVertices[face[1]]),
+                               PositionKey(generatedVertices[face[2]]) },
+                { uv[0], uv[1], uv[2] } });
+        } else if (4 == face.size()) {
+            uvMap.insert({ { PositionKey(generatedVertices[face[0]]),
+                               PositionKey(generatedVertices[face[1]]),
+                               PositionKey(generatedVertices[face[2]]) },
+                { uv[0], uv[1], uv[2] } });
+            uvMap.insert({ { PositionKey(generatedVertices[face[2]]),
+                               PositionKey(generatedVertices[face[3]]),
+                               PositionKey(generatedVertices[face[0]]) },
+                { uv[2], uv[3], uv[0] } });
+        }
+    };
+
+    if (componentHasImage) {
+        // Single chart: all faces mapped to the component texture via 2D projection UVs.
+        auto& triangleUvs = componentCache.componentTriangleUvs[componentId];
+        for (size_t i = 0; i < faceUvs.size(); ++i)
+            insertTriangleUv(triangleUvs, generatedFaces[i], faceUvs[i]);
+    } else {
+        // Per-part sub-charts: delegate to the builder.
+        for (auto& [id, uvMap] : loopMeshBuilder->buildPerLoopTriangleUvs()) {
+            auto& dest = componentCache.componentTriangleUvs[id.isNull() ? componentId : id];
+            dest.insert(uvMap.begin(), uvMap.end());
+        }
+    }
+    const auto& vertexSources = loopMeshBuilder->generatedVertexSources();
+    for (size_t i = 0; i < vertexSources.size(); ++i) {
+        componentCache.positionToNodeIdMap.emplace(std::make_pair(PositionKey(generatedVertices[i]), vertexSources[i]));
+    }
+
+    // Generate preview for each stitching loop
+    for (const auto& loop : loopMeshBuilder->loops()) {
+        RopeMesh::BuildParameters buildParameters;
+        buildParameters.defaultRadius = 0.03;
+        RopeMesh ropeMesh(buildParameters);
+        std::vector<Vector3> positions(loop.nodes.size());
+        for (size_t i = 0; i < loop.nodes.size(); ++i)
+            positions[i] = loop.nodes[i].origin;
+        ropeMesh.addRope(positions, loop.closed);
+
+        ComponentPreview stitchingLoopPreview;
+        if (mesh)
+            mesh->fetch(stitchingLoopPreview.vertices, stitchingLoopPreview.triangles);
+        size_t startIndex = stitchingLoopPreview.vertices.size();
+
+        stitchingLoopPreview.color = Color(color[0], color[1], color[2], 0.15);
+        for (const auto& ropeVertex : ropeMesh.resultVertices())
+            stitchingLoopPreview.vertices.emplace_back(ropeVertex);
+        stitchingLoopPreview.vertexProperties.resize(stitchingLoopPreview.vertices.size());
+        auto modelProperty = std::tuple<dust3d::Color, float, float> {
+            stitchingLoopPreview.color,
+            stitchingLoopPreview.metalness,
+            stitchingLoopPreview.roughness
+        };
+        auto findLoopColor = loopPartColors.find(loop.sourceId);
+        Color ropeColor = (findLoopColor != loopPartColors.end()) ? findLoopColor->second : color;
+        auto lineProperty = std::tuple<dust3d::Color, float, float> {
+            Color(ropeColor.r(), ropeColor.g(), ropeColor.b(), 1.0),
+            stitchingLoopPreview.metalness,
+            stitchingLoopPreview.roughness
+        };
+        for (size_t i = 0; i < startIndex; ++i)
+            stitchingLoopPreview.vertexProperties[i] = modelProperty;
+        for (size_t i = startIndex; i < stitchingLoopPreview.vertexProperties.size(); ++i)
+            stitchingLoopPreview.vertexProperties[i] = lineProperty;
+        for (const auto& ropeTriangles : ropeMesh.resultTriangles()) {
+            stitchingLoopPreview.triangles.emplace_back(std::vector<size_t> {
+                startIndex + ropeTriangles[0],
+                startIndex + ropeTriangles[1],
+                startIndex + ropeTriangles[2] });
+        }
+        addComponentPreview(loop.sourceId, ComponentPreview(stitchingLoopPreview));
     }
 
     return mesh;
@@ -676,12 +864,14 @@ std::unique_ptr<MeshState> MeshGenerator::combinePartMesh(const std::string& par
     partCache.metalness = metalness;
     partCache.roughness = roughness;
     partCache.isSuccessful = false;
-    partCache.joined = (target == PartTarget::Model && !isDisabled);
+    partCache.joined = ((target == PartTarget::Model || target == PartTarget::ImportedModel) && !isDisabled);
 
     partCache.nodeMap.clear();
-    for (const auto& meshNode : meshNodes) {
-        partCache.nodeMap.emplace(std::make_pair(meshNode.sourceId,
-            ObjectNode { meshNode.origin, color, smoothCutoffDegrees }));
+    {
+        for (const auto& meshNode : meshNodes) {
+            partCache.nodeMap.emplace(std::make_pair(meshNode.sourceId,
+                ObjectNode { meshNode.origin, color, smoothCutoffDegrees }));
+        }
     }
 
     if (PartTarget::Model == target) {
@@ -727,6 +917,127 @@ std::unique_ptr<MeshState> MeshGenerator::combinePartMesh(const std::string& par
         for (size_t i = 0; i < vertexSources.size(); ++i) {
             partCache.positionToNodeIdMap.emplace(std::make_pair(PositionKey(partCache.vertices[i]), vertexSources[i]));
         }
+    } else if (PartTarget::ImportedModel == target) {
+        std::string importedModelIdString = String::valueOrEmpty(part, "importedModelId");
+        auto findImportedModel = m_importedModelData.find(importedModelIdString);
+        if (findImportedModel != m_importedModelData.end()) {
+            const auto& importedData = findImportedModel->second;
+            if (!importedData.vertices.empty() && !importedData.faces.empty()) {
+                // Compute imported mesh bounding box
+                Vector3 importedMin = importedData.vertices[0];
+                Vector3 importedMax = importedData.vertices[0];
+                for (const auto& v : importedData.vertices) {
+                    importedMin.setX(std::min(importedMin.x(), v.x()));
+                    importedMin.setY(std::min(importedMin.y(), v.y()));
+                    importedMin.setZ(std::min(importedMin.z(), v.z()));
+                    importedMax.setX(std::max(importedMax.x(), v.x()));
+                    importedMax.setY(std::max(importedMax.y(), v.y()));
+                    importedMax.setZ(std::max(importedMax.z(), v.z()));
+                }
+
+                // Sweep the imported mesh along the tube spine: Y becomes the
+                // primary (spine) axis, X/Z become the cross-section.
+                SpineDeformer spineDeformer(meshNodes, importedMin, importedMax,
+                    deformWidth, deformThickness, cutRotation);
+
+                partCache.vertices.resize(importedData.vertices.size());
+                for (size_t vi = 0; vi < importedData.vertices.size(); ++vi) {
+                    partCache.vertices[vi] = spineDeformer.deformVertex(importedData.vertices[vi]);
+                }
+
+                if (!__mirrorFromPartId.empty()) {
+                    for (auto& it : partCache.vertices)
+                        it.setX(-it.x());
+                }
+
+                partCache.faces = importedData.faces;
+                if (!__mirrorFromPartId.empty()) {
+                    for (auto& it : partCache.faces)
+                        std::reverse(it.begin(), it.end());
+                }
+
+                // Build triangleUvs using deformed vertex positions as keys.
+                // importedData.triangleUvs uses pre-deformation position keys,
+                // but the packer/renderer looks up by deformed position keys.
+                if (!importedData.triangleUvs.empty()) {
+                    std::vector<Vector2> perVertexUv(importedData.vertices.size(), Vector2(0, 0));
+                    for (const auto& face : importedData.faces) {
+                        if (face.size() < 3)
+                            continue;
+                        auto findUv = importedData.triangleUvs.find({ PositionKey(importedData.vertices[face[0]]),
+                            PositionKey(importedData.vertices[face[1]]),
+                            PositionKey(importedData.vertices[face[2]]) });
+                        if (findUv != importedData.triangleUvs.end()) {
+                            perVertexUv[face[0]] = findUv->second[0];
+                            perVertexUv[face[1]] = findUv->second[1];
+                            perVertexUv[face[2]] = findUv->second[2];
+                        }
+                    }
+                    for (const auto& face : partCache.faces) {
+                        if (face.size() < 3)
+                            continue;
+                        partCache.triangleUvs.insert({ { PositionKey(partCache.vertices[face[0]]),
+                                                           PositionKey(partCache.vertices[face[1]]),
+                                                           PositionKey(partCache.vertices[face[2]]) },
+                            { perVertexUv[face[0]], perVertexUv[face[1]], perVertexUv[face[2]] } });
+                    }
+                }
+
+                // Store per-vertex colors from imported model
+                if (!importedData.vertexColors.empty()) {
+                    for (size_t i = 0; i < partCache.vertices.size(); ++i) {
+                        if (i < importedData.vertexColors.size()) {
+                            partCache.importedVertexColorMap[PositionKey(partCache.vertices[i])] = importedData.vertexColors[i];
+                        }
+                    }
+                }
+
+                // Transform and store per-face-vertex normals from imported model
+                // When smoothCutoffDegrees is set, skip GLB normals and let smoothNormal handle it
+                if (!importedData.vertexNormals.empty() && smoothCutoffDegrees < 0.01f) {
+                    auto transformNormal = [&](size_t vi) -> Vector3 {
+                        const auto& sv = importedData.vertices[vi];
+                        Vector3 transformed = spineDeformer.deformNormal(importedData.vertexNormals[vi], sv.y());
+                        if (!__mirrorFromPartId.empty())
+                            transformed.setX(-transformed.x());
+                        return transformed;
+                    };
+
+                    for (const auto& face : partCache.faces) {
+                        if (face.size() < 3)
+                            continue;
+                        if (face[0] >= importedData.vertexNormals.size()
+                            || face[1] >= importedData.vertexNormals.size()
+                            || face[2] >= importedData.vertexNormals.size())
+                            continue;
+                        std::array<PositionKey, 3> triKey = {
+                            PositionKey(partCache.vertices[face[0]]),
+                            PositionKey(partCache.vertices[face[1]]),
+                            PositionKey(partCache.vertices[face[2]])
+                        };
+                        partCache.importedTriangleNormals[triKey] = {
+                            transformNormal(face[0]),
+                            transformNormal(face[1]),
+                            transformNormal(face[2])
+                        };
+                    }
+                }
+
+                for (size_t i = 0; i < partCache.vertices.size(); ++i) {
+                    // Map each vertex to the nearest node for source tracking
+                    double bestDist = std::numeric_limits<double>::max();
+                    Uuid bestNodeId;
+                    for (const auto& mn : meshNodes) {
+                        double d = (partCache.vertices[i] - mn.origin).lengthSquared();
+                        if (d < bestDist) {
+                            bestDist = d;
+                            bestNodeId = mn.sourceId;
+                        }
+                    }
+                    partCache.positionToNodeIdMap.emplace(std::make_pair(PositionKey(partCache.vertices[i]), bestNodeId));
+                }
+            }
+        }
     }
 
     bool hasMeshError = false;
@@ -737,7 +1048,7 @@ std::unique_ptr<MeshState> MeshGenerator::combinePartMesh(const std::string& par
         hasMeshError = true;
     }
 
-    if (PartTarget::Model == target) {
+    if (PartTarget::Model == target || PartTarget::ImportedModel == target) {
         ComponentPreview preview;
         if (mesh)
             mesh->fetch(preview.vertices, preview.triangles);
@@ -760,7 +1071,7 @@ std::unique_ptr<MeshState> MeshGenerator::combinePartMesh(const std::string& par
         mesh.reset();
     }
 
-    if (hasMeshError && target == PartTarget::Model) {
+    if (hasMeshError && (target == PartTarget::Model || target == PartTarget::ImportedModel)) {
         *hasError = true;
     }
 
@@ -850,6 +1161,10 @@ std::unique_ptr<MeshState> MeshGenerator::combineComponentMesh(const std::string
             componentCache.componentTriangleUvs.insert({ componentId, partCache.triangleUvs });
             for (const auto& it : partCache.positionToNodeIdMap)
                 componentCache.positionToNodeIdMap.emplace(it);
+            for (const auto& it : partCache.importedVertexColorMap)
+                componentCache.importedVertexColorMap.emplace(it);
+            for (const auto& it : partCache.importedTriangleNormals)
+                componentCache.importedTriangleNormals.emplace(it);
             for (const auto& it : partCache.nodeMap)
                 componentCache.nodeMap.emplace(it);
         }
@@ -863,6 +1178,8 @@ std::unique_ptr<MeshState> MeshGenerator::combineComponentMesh(const std::string
         auto lastCombineMode = CombineMode::Count;
         std::vector<std::string> stitchingParts;
         std::vector<std::string> stitchingComponents;
+        std::vector<std::string> stitchingLoopParts;
+        std::vector<std::string> stitchingLoopComponents;
         for (const auto& childIdString : String::split(String::valueOrEmpty(*component, "children"), ',')) {
             if (childIdString.empty())
                 continue;
@@ -876,6 +1193,11 @@ std::unique_ptr<MeshState> MeshGenerator::combineComponentMesh(const std::string
                     if ("StitchingLine" == String::valueOrEmpty(findPart->second, "target")) {
                         stitchingParts.emplace_back(partIdString);
                         stitchingComponents.emplace_back(childIdString);
+                        continue;
+                    }
+                    if ("StitchingLoop" == String::valueOrEmpty(findPart->second, "target")) {
+                        stitchingLoopParts.emplace_back(partIdString);
+                        stitchingLoopComponents.emplace_back(childIdString);
                         continue;
                     }
                 }
@@ -913,12 +1235,37 @@ std::unique_ptr<MeshState> MeshGenerator::combineComponentMesh(const std::string
                 groupMeshes.emplace_back(std::make_tuple(std::move(stitchingMesh), CombineMode::Normal, String::join(stitchingComponents, ":")));
             }
         }
+        if (!stitchingLoopParts.empty()) {
+            float backCloseDepthRatio = 1.0f;
+            float backCloseSharpness = 0.0f;
+            {
+                auto it = component->find("backCloseDepthRatio");
+                if (it != component->end())
+                    backCloseDepthRatio = String::toFloat(it->second);
+                it = component->find("backCloseSharpness");
+                if (it != component->end())
+                    backCloseSharpness = String::toFloat(it->second);
+            }
+            auto stitchingLoopMesh = combineStitchingLoopMesh(componentIdString,
+                stitchingLoopParts,
+                stitchingLoopComponents,
+                String::isTrue(String::valueOrEmpty(*component, "backClosed")),
+                backCloseDepthRatio,
+                backCloseSharpness,
+                targetSegments,
+                color,
+                smoothCutoffDegrees,
+                componentCache);
+            if (stitchingLoopMesh && !stitchingLoopMesh->isNull()) {
+                groupMeshes.emplace_back(std::make_tuple(std::move(stitchingLoopMesh), CombineMode::Normal, String::join(stitchingLoopComponents, ":")));
+            }
+        }
         mesh = combineMultipleMeshes(std::move(groupMeshes), &componentCache.brokenTriangles);
         ComponentPreview preview;
         if (mesh) {
             mesh->fetch(preview.vertices, preview.triangles);
             preview.color = color;
-            if (!stitchingParts.empty()) {
+            if (!stitchingParts.empty() || !stitchingLoopParts.empty()) {
                 for (const auto& it : componentCache.componentTriangleUvs) {
                     for (const auto& uvs : it.second)
                         preview.triangleUvs.insert(uvs);
@@ -999,6 +1346,9 @@ std::unique_ptr<MeshState> MeshGenerator::combineComponentChildGroupMesh(const s
         std::unique_ptr<MeshState> subMesh = combineComponentMesh(childIdString, &childCombineMode);
 
         if (CombineMode::Uncombined == childCombineMode) {
+            const auto& uncombinedCache = m_cacheContext->components[childIdString];
+            for (const auto& it : uncombinedCache.importedTriangleNormals)
+                componentCache.importedTriangleNormals.emplace(it);
             continue;
         }
 
@@ -1013,7 +1363,10 @@ std::unique_ptr<MeshState> MeshGenerator::combineComponentChildGroupMesh(const s
             componentCache.positionToNodeIdMap.emplace(it);
         for (const auto& it : childComponentCache.nodeMap)
             componentCache.nodeMap.emplace(it);
-
+        for (const auto& it : childComponentCache.importedVertexColorMap)
+            componentCache.importedVertexColorMap.emplace(it);
+        for (const auto& it : childComponentCache.importedTriangleNormals)
+            componentCache.importedTriangleNormals.emplace(it);
         if (nullptr == subMesh || subMesh->isNull()) {
             continue;
         }
@@ -1077,6 +1430,45 @@ void MeshGenerator::postprocessObject(Object* object)
         object->triangleNormals,
         &object->vertexSmoothCutoffDegrees,
         &triangleVertexNormals);
+
+    // Position-based normal merge for imported meshes with user-configured smoothCutoffDegrees.
+    // smoothNormal uses vertex-index adjacency, so GLTF meshes with per-face-vertex data
+    // (where each triangle corner has a unique index even at the same position) always get
+    // flat normals from smoothNormal. This pass groups face normals by position and only
+    // merges those within the cutoff angle.
+    if (!m_importedModelData.empty()) {
+        std::map<PositionKey, std::vector<size_t>> posToTriangles;
+        for (size_t ti = 0; ti < object->triangles.size(); ++ti) {
+            const auto& face = object->triangles[ti];
+            for (size_t j = 0; j < face.size() && j < 3; ++j) {
+                if (face[j] < object->vertexSmoothCutoffDegrees.size()
+                    && object->vertexSmoothCutoffDegrees[face[j]] > 0.0f) {
+                    posToTriangles[PositionKey(object->vertices[face[j]])].push_back(ti);
+                }
+            }
+        }
+        for (size_t ti = 0; ti < object->triangles.size(); ++ti) {
+            const auto& face = object->triangles[ti];
+            for (size_t j = 0; j < face.size() && j < 3; ++j) {
+                if (face[j] >= object->vertexSmoothCutoffDegrees.size()
+                    || object->vertexSmoothCutoffDegrees[face[j]] <= 0.0f)
+                    continue;
+                float cutoff = object->vertexSmoothCutoffDegrees[face[j]];
+                double cosLimit = std::cos(cutoff * Math::Pi / 180.0);
+                auto it = posToTriangles.find(PositionKey(object->vertices[face[j]]));
+                if (it == posToTriangles.end())
+                    continue;
+                Vector3 sum;
+                for (size_t neighborTi : it->second) {
+                    if (Vector3::dotProduct(object->triangleNormals[ti], object->triangleNormals[neighborTi]) >= cosLimit)
+                        sum += object->triangleNormals[neighborTi];
+                }
+                sum.normalize();
+                triangleVertexNormals[ti][j] = sum;
+            }
+        }
+    }
+
     object->setTriangleVertexNormals(triangleVertexNormals);
 }
 
@@ -1176,7 +1568,7 @@ void MeshGenerator::interpolateEdgesAroundJoints()
         if (findPart == m_snapshot->parts.end())
             continue;
         auto target = PartTargetFromString(String::valueOrEmpty(findPart->second, "target").c_str());
-        if (PartTarget::Model != target)
+        if (PartTarget::Model != target && PartTarget::ImportedModel != target)
             continue;
         std::vector<std::string> edgesToInterpolate;
         for (const auto& edgeIdString : partEntry.second) {
@@ -1559,6 +1951,40 @@ void MeshGenerator::generate()
     collectBrokenTriangles(to_string(Uuid()));
 
     postprocessObject(m_object);
+
+    // Override vertex colors from imported models
+    if (!componentCache.importedVertexColorMap.empty()) {
+        for (size_t i = 0; i < m_object->vertices.size(); ++i) {
+            auto findColor = componentCache.importedVertexColorMap.find(m_object->vertices[i]);
+            if (findColor != componentCache.importedVertexColorMap.end()) {
+                m_object->vertexColors[i] = findColor->second;
+            }
+        }
+    }
+
+    // Override vertex normals from imported models
+    if (!componentCache.importedTriangleNormals.empty()) {
+        const auto* triNormals = m_object->triangleVertexNormals();
+        if (triNormals && triNormals->size() == m_object->triangles.size()) {
+            std::vector<std::vector<Vector3>> newTriNormals = *triNormals;
+            for (size_t ti = 0; ti < m_object->triangles.size(); ++ti) {
+                const auto& face = m_object->triangles[ti];
+                if (face.size() < 3)
+                    continue;
+                std::array<PositionKey, 3> triKey = {
+                    PositionKey(m_object->vertices[face[0]]),
+                    PositionKey(m_object->vertices[face[1]]),
+                    PositionKey(m_object->vertices[face[2]])
+                };
+                auto findTriNormals = componentCache.importedTriangleNormals.find(triKey);
+                if (findTriNormals != componentCache.importedTriangleNormals.end()) {
+                    for (size_t j = 0; j < 3; ++j)
+                        newTriNormals[ti][j] = findTriNormals->second[j];
+                }
+            }
+            m_object->setTriangleVertexNormals(newTriNormals);
+        }
+    }
 
     if (needDeleteCacheContext) {
         delete m_cacheContext;

@@ -1,12 +1,20 @@
 #include "component_preview_grid_widget.h"
 #include "component_list_model.h"
 #include "theme.h"
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDrag>
 #include <QDragEnterEvent>
 #include <QDragLeaveEvent>
 #include <QDropEvent>
+#include <QGuiApplication>
+#include <QHBoxLayout>
+#include <QLabel>
 #include <QMimeData>
 #include <QPainter>
+#include <QResizeEvent>
+#include <QShowEvent>
+#include <QVBoxLayout>
 #include <algorithm>
 #include <memory>
 
@@ -23,6 +31,89 @@ ComponentPreviewGridWidget::ComponentPreviewGridWidget(Document* document, QWidg
     setDefaultDropAction(Qt::DropAction::MoveAction);
     setDragDropMode(QAbstractItemView::DragDrop);
     setDropIndicatorShown(true);
+
+    // Info bar: sits above the viewport as a real child widget
+    m_infoBar = new QFrame(this);
+    m_infoBar->setAutoFillBackground(true);
+    {
+        QPalette pal = m_infoBar->palette();
+        pal.setColor(QPalette::Window, QColor(Theme::blue.red(), Theme::blue.green(), Theme::blue.blue(), 160));
+        m_infoBar->setPalette(pal);
+    }
+    m_infoBarLabel = new QLabel;
+    m_infoBarLabel->setText(tr("Stitching line: line order matters, drag to reorder"));
+    m_infoBarLabel->setStyleSheet("color: white;");
+    m_infoBarLabel->setFont([]() {
+        QFont f = QGuiApplication::font();
+        f.setPixelSize(qMax(10, qRound(QGuiApplication::font().pixelSize() * 0.8)));
+        return f;
+    }());
+    m_infoBarLabel->setWordWrap(true);
+    {
+        QHBoxLayout* barLayout = new QHBoxLayout(m_infoBar);
+        barLayout->setContentsMargins(6, 2, 6, 2);
+        barLayout->addWidget(m_infoBarLabel);
+    }
+    m_infoBar->hide();
+
+    // Stitching loop info bar
+    m_infoBar2 = new QFrame(this);
+    m_infoBar2->setAutoFillBackground(true);
+    {
+        QPalette pal = m_infoBar2->palette();
+        pal.setColor(QPalette::Window, QColor(Theme::blue.red(), Theme::blue.green(), Theme::blue.blue(), 160));
+        m_infoBar2->setPalette(pal);
+    }
+    m_infoBar2Label = new QLabel;
+    m_infoBar2Label->setText(tr("Stitching loop: edge loops must not overlap, and are auto x-mirrored"));
+    m_infoBar2Label->setStyleSheet("color: white;");
+    m_infoBar2Label->setWordWrap(true);
+    m_infoBar2Label->setFont([]() {
+        QFont f = QGuiApplication::font();
+        f.setPixelSize(qMax(10, qRound(QGuiApplication::font().pixelSize() * 0.8)));
+        return f;
+    }());
+    {
+        QHBoxLayout* bar2Layout = new QHBoxLayout(m_infoBar2);
+        bar2Layout->setContentsMargins(6, 2, 6, 2);
+        bar2Layout->addWidget(m_infoBar2Label);
+    }
+    m_infoBar2->hide();
+
+    // Ungrouped stitching parts info bar (shown at root level)
+    m_infoBar3 = new QFrame(this);
+    m_infoBar3->setAutoFillBackground(true);
+    {
+        QPalette pal = m_infoBar3->palette();
+        pal.setColor(QPalette::Window, QColor(Theme::blue.red(), Theme::blue.green(), Theme::blue.blue(), 130));
+        m_infoBar3->setPalette(pal);
+    }
+    m_infoBar3Label = new QLabel;
+    m_infoBar3Label->setText(tr("\u24d8  Stitching line/loop parts must be inside a group to configure stitching parameters"));
+    m_infoBar3Label->setStyleSheet("color: white;");
+    m_infoBar3Label->setWordWrap(true);
+    m_infoBar3Label->setFont([]() {
+        QFont f = QGuiApplication::font();
+        f.setPixelSize(qMax(10, qRound(QGuiApplication::font().pixelSize() * 0.8)));
+        return f;
+    }());
+    {
+        QHBoxLayout* bar3Layout = new QHBoxLayout(m_infoBar3);
+        bar3Layout->setContentsMargins(6, 2, 6, 2);
+        bar3Layout->addWidget(m_infoBar3Label);
+    }
+    m_infoBar3->hide();
+
+    connect(m_componentListModel.get(), &ComponentListModel::listingComponentChanged, this, [this](const dust3d::Uuid&) {
+        updateInfoBar();
+    });
+    connect(m_document, &Document::componentChildrenChanged, this, [this](const dust3d::Uuid& componentId) {
+        if (componentId == m_componentListModel->listingComponentId())
+            updateInfoBar();
+    });
+    connect(m_document, &Document::partTargetChanged, this, [this](const dust3d::Uuid&) {
+        updateInfoBar();
+    });
 
     connect(this, &ComponentPreviewGridWidget::doubleClicked, [this](const QModelIndex& index) {
         const Document::Component* component = this->componentListModel()->modelIndexToComponent(index);
@@ -164,6 +255,12 @@ void ComponentPreviewGridWidget::dropEvent(QDropEvent* event)
     }
     int dropRow = dropIndex.isValid() ? dropIndex.row() : m_componentListModel->rowCount();
 
+    // Check if dropping onto a group component
+    const Document::Component* dropTargetComponent = dropIndex.isValid()
+        ? m_componentListModel->modelIndexToComponent(dropIndex)
+        : nullptr;
+    bool dropTargetIsGroup = dropTargetComponent && !dropTargetComponent->childrenIds.empty();
+
     // Get the source items (selected rows)
     QModelIndexList selectedIndexes = selectionModel()->selectedIndexes();
     if (selectedIndexes.isEmpty()) {
@@ -210,6 +307,64 @@ void ComponentPreviewGridWidget::dropEvent(QDropEvent* event)
     if (selectedComponentIds.empty()) {
         event->ignore();
         return;
+    }
+
+    // If dropping onto a group, ask user whether to move into the group
+    if (dropTargetIsGroup) {
+        // Build a custom dialog: question + [src preview] -> [dst preview]
+        QDialog dlg(this);
+        dlg.setWindowTitle(tr("Move into Group"));
+
+        QVBoxLayout* vLayout = new QVBoxLayout(&dlg);
+
+        QLabel* questionLabel = new QLabel(tr("Do you want to move the selected component(s) into the group?"), &dlg);
+        questionLabel->setWordWrap(true);
+        vLayout->addWidget(questionLabel);
+
+        QHBoxLayout* previewLayout = new QHBoxLayout;
+        previewLayout->setSpacing(8);
+
+        auto makePreviewLabel = [&dlg](const QPixmap& pixmap) -> QLabel* {
+            QLabel* lbl = new QLabel(&dlg);
+            lbl->setFixedSize(64, 64);
+            lbl->setAlignment(Qt::AlignCenter);
+            if (!pixmap.isNull())
+                lbl->setPixmap(pixmap.scaled(64, 64, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+            else
+                lbl->setText(tr("?"));
+            return lbl;
+        };
+
+        // Source: first selected component
+        const Document::Component* srcComponent = m_document->findComponent(selectedComponentIds.front());
+        QPixmap srcPixmap = srcComponent ? srcComponent->previewPixmap : QPixmap();
+        previewLayout->addWidget(makePreviewLabel(srcPixmap));
+
+        QLabel* arrowLabel = new QLabel("→", &dlg);
+        arrowLabel->setAlignment(Qt::AlignCenter);
+        previewLayout->addWidget(arrowLabel);
+
+        previewLayout->addWidget(makePreviewLabel(dropTargetComponent->previewPixmap));
+        previewLayout->addStretch();
+        vLayout->addLayout(previewLayout);
+
+        QDialogButtonBox* buttons = new QDialogButtonBox(QDialogButtonBox::Yes | QDialogButtonBox::No, &dlg);
+        QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        vLayout->addWidget(buttons);
+
+        if (dlg.exec() == QDialog::Accepted) {
+            for (const auto& componentId : selectedComponentIds) {
+                m_document->moveComponent(componentId, dropTargetComponent->id);
+            }
+            m_isDragging = false;
+            m_dropIndicatorRow = -1;
+            viewport()->update();
+            event->accept();
+            m_document->saveSnapshot();
+            return;
+        }
+        // If No, fall through to reorder behavior
     }
 
     // Remove selected items from the all list (in reverse to maintain indices)
@@ -273,6 +428,64 @@ void ComponentPreviewGridWidget::dragLeaveEvent(QDragLeaveEvent* event)
     m_dropIndicatorRow = -1;
     viewport()->update();
     QListView::dragLeaveEvent(event);
+}
+
+void ComponentPreviewGridWidget::resizeEvent(QResizeEvent* event)
+{
+    QListView::resizeEvent(event);
+    updateInfoBar();
+}
+
+void ComponentPreviewGridWidget::showEvent(QShowEvent* event)
+{
+    QListView::showEvent(event);
+    updateInfoBar();
+}
+
+void ComponentPreviewGridWidget::updateInfoBar()
+{
+    if (!m_infoBar || !m_infoBar2 || !m_infoBar3)
+        return;
+
+    bool showLine = m_componentListModel->hasStitchingLineOrdering();
+    bool showLoop = m_componentListModel->hasStitchingLoopInfo();
+    int totalH = 0;
+
+    if (showLine) {
+        m_infoBarLabel->setFixedWidth(qMax(1, width() - 12));
+        int h = m_infoBar->sizeHint().height();
+        m_infoBar->setGeometry(0, 0, width(), h);
+        m_infoBar->show();
+        m_infoBar->raise();
+        totalH += h;
+    } else {
+        m_infoBar->hide();
+    }
+
+    if (showLoop) {
+        m_infoBar2Label->setFixedWidth(qMax(1, width() - 12));
+        int h = m_infoBar2->sizeHint().height();
+        m_infoBar2->setGeometry(0, totalH, width(), h);
+        m_infoBar2->show();
+        m_infoBar2->raise();
+        totalH += h;
+    } else {
+        m_infoBar2->hide();
+    }
+
+    bool showUngrouped = m_componentListModel->hasUngroupedStitchingParts();
+    if (showUngrouped) {
+        m_infoBar3Label->setFixedWidth(qMax(1, width() - 12));
+        int h = m_infoBar3->sizeHint().height();
+        m_infoBar3->setGeometry(0, totalH, width(), h);
+        m_infoBar3->show();
+        m_infoBar3->raise();
+        totalH += h;
+    } else {
+        m_infoBar3->hide();
+    }
+
+    setViewportMargins(0, totalH, 0, 0);
 }
 
 void ComponentPreviewGridWidget::paintEvent(QPaintEvent* event)

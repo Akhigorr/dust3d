@@ -185,6 +185,21 @@ namespace biped {
         animationClip.durationSeconds = durationSeconds;
         animationClip.frames.resize(frameCount);
 
+        // Hair chain physics: reactive snap, higher stiffness for quick response.
+        const std::vector<std::string> hairBoneNames = { "HairBack1", "HairBack2", "HairBack3" };
+        animation::HairChainSimulator hairSim;
+        if (boneIdx.count("HairBack1"))
+            hairSim.initialize(rigStructure, boneIdx, hairBoneNames,
+                animation::buildBoneWorldTransform(bonePos("Head"), boneEnd("Head")),
+                0.18, 0.80, 1.0);
+        double hairDt = durationSeconds / std::max(1, frameCount);
+
+        animation::CapeGridSimulator capeSim;
+        if (boneIdx.count("CenterCape1"))
+            capeSim.initialize(rigStructure, boneIdx,
+                animation::buildBoneWorldTransform(bonePos("Chest"), boneEnd("Chest")),
+                0.08, 0.85, 1.2, 0.15);
+
         for (int frame = 0; frame < frameCount; ++frame) {
             double tNormalized = static_cast<double>(frame) / static_cast<double>(frameCount);
 
@@ -494,6 +509,12 @@ namespace biped {
             }
 
             // === Build skin matrices ===
+            // Hair physics step.
+            if (hairSim.active)
+                hairSim.step(boneWorldTransforms["Head"], hairDt, boneWorldTransforms);
+            if (capeSim.active)
+                capeSim.step(boneWorldTransforms["Chest"], hairDt, boneWorldTransforms);
+
             auto& frameData = animationClip.frames[frame];
             frameData.time = static_cast<float>(tNormalized) * durationSeconds;
             frameData.boneWorldTransforms = boneWorldTransforms;

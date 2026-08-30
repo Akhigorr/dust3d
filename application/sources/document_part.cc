@@ -11,6 +11,7 @@ Document::Part::Part(const dust3d::Uuid& withId)
     , deformUnified(false)
     , rounded(false)
     , chamfered(false)
+    , fillLoopInterior(false)
     , dirty(true)
     , cutRotation(0.0)
     , cutFace(dust3d::CutFace::Quad)
@@ -136,4 +137,5 @@ void Document::Part::copyAttributes(const Part& other)
     roughness = other.roughness;
     deformUnified = other.deformUnified;
     hollowThickness = other.hollowThickness;
+    importedModelId = other.importedModelId;
 }

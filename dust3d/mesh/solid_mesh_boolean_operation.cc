@@ -167,13 +167,13 @@ bool SolidMeshBooleanOperation::buildPolygonsFromEdges(const std::map<size_t, st
 }
 
 void SolidMeshBooleanOperation::buildFaceGroups(const std::vector<std::vector<size_t>>& intersections,
-    const std::map<uint64_t, size_t>& halfEdges,
+    const std::map<std::uint64_t, size_t>& halfEdges,
     const std::vector<std::vector<size_t>>& triangles,
     size_t remainingStartTriangleIndex,
     size_t remainingTriangleCount,
     std::vector<std::vector<size_t>>& triangleGroups)
 {
-    std::map<uint64_t, size_t> halfEdgeGroupMap;
+    std::map<std::uint64_t, size_t> halfEdgeGroupMap;
     size_t groupIndex = 0;
     std::queue<std::pair<size_t, size_t>> waitQ;
     for (const auto& intersection : intersections) {
@@ -251,7 +251,7 @@ size_t SolidMeshBooleanOperation::addNewPoint(const Vector3& position)
 
 bool SolidMeshBooleanOperation::addUnintersectedTriangles(const SolidMesh* mesh,
     const std::set<size_t>& usedFaces,
-    std::map<uint64_t, size_t>* halfEdges)
+    std::map<std::uint64_t, size_t>* halfEdges)
 {
     size_t oldVertexCount = m_newVertices.size();
     const auto& vertices = *mesh->vertices();
@@ -271,15 +271,15 @@ bool SolidMeshBooleanOperation::addUnintersectedTriangles(const SolidMesh* mesh,
         const auto& newInsertedTriangle = m_newTriangles.back();
         if (!halfEdges->insert({ makeHalfEdgeKey(newInsertedTriangle[0], newInsertedTriangle[1]), newInsertedIndex }).second) {
             dust3dDebug << "Found repeated halfedge:" << newInsertedTriangle[0] << "," << newInsertedTriangle[1];
-            return false;
+            continue;
         }
         if (!halfEdges->insert({ makeHalfEdgeKey(newInsertedTriangle[1], newInsertedTriangle[2]), newInsertedIndex }).second) {
-            dust3dDebug << "Found repeated halfedge:" << newInsertedTriangle[0] << "," << newInsertedTriangle[1];
-            return false;
+            dust3dDebug << "Found repeated halfedge:" << newInsertedTriangle[1] << "," << newInsertedTriangle[2];
+            continue;
         }
         if (!halfEdges->insert({ makeHalfEdgeKey(newInsertedTriangle[2], newInsertedTriangle[0]), newInsertedIndex }).second) {
-            dust3dDebug << "Found repeated halfedge:" << newInsertedTriangle[0] << "," << newInsertedTriangle[1];
-            return false;
+            dust3dDebug << "Found repeated halfedge:" << newInsertedTriangle[2] << "," << newInsertedTriangle[0];
+            continue;
         }
     }
     return true;
@@ -337,14 +337,14 @@ bool SolidMeshBooleanOperation::combine()
     std::map<size_t, std::set<size_t>> secondEdges;
     std::vector<std::vector<size_t>> firstIntersections;
     std::vector<std::vector<size_t>> secondIntersections;
-    std::map<uint64_t, size_t> firstHalfEdges;
-    std::map<uint64_t, size_t> secondHalfEdges;
+    std::map<std::uint64_t, size_t> firstHalfEdges;
+    std::map<std::uint64_t, size_t> secondHalfEdges;
 
     auto reTriangulate = [&](const std::map<size_t, IntersectedContext>& context,
                              const SolidMesh* mesh,
                              size_t startOldVertex,
                              std::map<size_t, std::set<size_t>>& edges,
-                             std::map<uint64_t, size_t>& halfEdges) {
+                             std::map<std::uint64_t, size_t>& halfEdges) {
         for (const auto& [contextKey, it] : context) {
             const auto& triangle = (*mesh->triangles())[contextKey];
             ReTriangulator reTriangulator({ (*mesh->vertices())[triangle[0]],
@@ -377,7 +377,7 @@ bool SolidMeshBooleanOperation::combine()
                     dust3dDebug << "Found repeated halfedge:" << newInsertedTriangle[1] << "," << newInsertedTriangle[2];
                 }
                 if (!halfEdges.insert({ makeHalfEdgeKey(newInsertedTriangle[2], newInsertedTriangle[0]), newInsertedIndex }).second) {
-                    dust3dDebug << "Found repeated halfedge:" << newInsertedTriangle[3] << "," << newInsertedTriangle[0];
+                    dust3dDebug << "Found repeated halfedge:" << newInsertedTriangle[2] << "," << newInsertedTriangle[0];
                 }
             }
             for (const auto& neighborIt : it.neighborMap) {

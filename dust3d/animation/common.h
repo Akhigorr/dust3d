@@ -220,6 +220,467 @@ namespace animation {
         return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
     }
 
+    // =========================================================================
+    // HAIR CHAIN PHYSICS SIMULATOR
+    // =========================================================================
+    //
+    // Simulates a chain of hair bones using verlet integration with inertia,
+    // length constraints, angular stiffness, and gravity. The root of the chain
+    // is pinned to the parent bone's animated world transform each frame.
+    // Subsequent nodes lag behind due to inertia, are pulled back toward the
+    // rigid-follow goal by a spring, and droop under gravity.
+    //
+    // Physics model:
+    //   1. Compute goalTip: where the tip would be if the bone rigidly followed
+    //      the parent (animated delta transform applied to bind-space tip).
+    //   2. Verlet integrate with damping:
+    //        vel   = (tip - prevTip) * damping
+    //        tip'  = tip + vel + gravity * dt^2
+    //   3. Apply stiffness spring pulling tip' toward goalTip.
+    //   4. Project tip' onto a sphere of radius boneLength centered at root
+    //      (length constraint -- enforces bone inextensibility).
+    //
+    // Usage:
+    //   HairChainSimulator hairSim;
+    //   hairSim.initialize(rig, boneIdx,
+    //       {"HairBack1", "HairBack2", "HairBack3"},
+    //       buildBoneWorldTransform(bonePos("Head"), boneEnd("Head")),
+    //       stiffness, damping, gravityScale);
+    //
+    //   // Inside frame loop, after parent bone world transform is known:
+    //   if (hairSim.active)
+    //       hairSim.step(boneWorldTransforms["Head"], dt, boneWorldTransforms);
+    struct HairChainSimulator {
+        struct BoneData {
+            std::string name;
+            Vector3 bindRoot; // bind-world-space root position
+            Vector3 bindTip; // bind-world-space tip position
+            double boneLength;
+        };
+
+        Matrix4x4 parentBindInverse; // inverse of parent's bind-world transform
+        std::vector<BoneData> bones;
+        std::vector<Vector3> tipPos; // current simulated tip positions
+        std::vector<Vector3> prevTipPos; // previous frame tip positions (verlet)
+        double stiffness = 0.12;
+        double damping = 0.88;
+        double gravityScale = 1.0;
+        bool active = false;
+
+        // Initialize the simulator from rig data.
+        // boneNames:           ordered chain of hair bone names, root to tip.
+        // parentBindTransform: the parent bone's bind-pose world transform
+        //                      (buildBoneWorldTransform of the head bone at rest).
+        // stiff:  spring fraction pulling toward rigid-follow pose (0=none, 1=rigid).
+        // damp:   velocity retention per frame (0=instant stop, 1=no damping).
+        // grav:   gravity multiplier (1=normal earth, 0=weightless).
+        void initialize(const RigStructure& rig,
+            const std::map<std::string, size_t>& idx,
+            const std::vector<std::string>& boneNames,
+            const Matrix4x4& parentBindTransform,
+            double stiff = 0.12,
+            double damp = 0.88,
+            double grav = 1.0)
+        {
+            stiffness = stiff;
+            damping = damp;
+            gravityScale = grav;
+            parentBindInverse = parentBindTransform.inverted();
+            bones.clear();
+            for (const auto& name : boneNames) {
+                auto it = idx.find(name);
+                if (it == idx.end())
+                    break; // stop at first missing bone in chain
+                const auto& b = rig.bones[it->second];
+                BoneData bd;
+                bd.name = name;
+                bd.bindRoot = Vector3(b.posX, b.posY, b.posZ);
+                bd.bindTip = Vector3(b.endX, b.endY, b.endZ);
+                bd.boneLength = (bd.bindTip - bd.bindRoot).length();
+                if (bd.boneLength < 1e-8)
+                    bd.boneLength = 1e-8;
+                bones.push_back(bd);
+            }
+            tipPos.resize(bones.size());
+            prevTipPos.resize(bones.size());
+            for (size_t i = 0; i < bones.size(); ++i) {
+                tipPos[i] = bones[i].bindTip;
+                prevTipPos[i] = bones[i].bindTip;
+            }
+            active = !bones.empty();
+        }
+
+        // Advance the simulation by one frame.
+        // parentWorldTransform: the parent (head) bone's world transform this frame.
+        // dt:  frame time step in seconds.
+        // out: receives the per-bone world transforms for the hair chain.
+        void step(const Matrix4x4& parentWorldTransform,
+            double dt,
+            std::map<std::string, Matrix4x4>& out)
+        {
+            if (!active)
+                return;
+
+            // Delta transform: maps bind-world positions to current world positions.
+            Matrix4x4 delta = parentWorldTransform;
+            delta *= parentBindInverse;
+
+            const Vector3 gravityAccel(0.0, -9.8 * gravityScale, 0.0);
+            const double dt2 = dt * dt;
+
+            for (size_t i = 0; i < bones.size(); ++i) {
+                // Root: first bone tracks animated parent, chain bones use simulated prev tip.
+                Vector3 root = (i == 0)
+                    ? delta.transformPoint(bones[0].bindRoot)
+                    : tipPos[i - 1];
+
+                // Goal tip: where the tip would land if this bone rigidly followed the parent.
+                // For chained bones, project the goal direction from the simulated root so
+                // the stiffness force stays body-relative even as the chain deviates.
+                Vector3 goalTipWorld = delta.transformPoint(bones[i].bindTip);
+                Vector3 goalRootWorld = delta.transformPoint(bones[i].bindRoot);
+                Vector3 goalDir = goalTipWorld - goalRootWorld;
+                double goalDirLen = goalDir.length();
+                if (goalDirLen > 1e-8)
+                    goalDir = goalDir * (1.0 / goalDirLen);
+                else
+                    goalDir = Vector3(0.0, -1.0, 0.0);
+                Vector3 goalTip = root + goalDir * bones[i].boneLength;
+
+                // Verlet integration with velocity damping.
+                Vector3 vel = (tipPos[i] - prevTipPos[i]) * damping;
+                Vector3 newTip = tipPos[i] + vel + gravityAccel * dt2;
+
+                // Stiffness spring: blend toward goal (rigid-follow) position.
+                newTip = newTip + (goalTip - newTip) * stiffness;
+
+                // Length constraint: project onto sphere of radius boneLength from root.
+                Vector3 toNew = newTip - root;
+                double toNewLen = toNew.length();
+                if (toNewLen > 1e-8)
+                    newTip = root + toNew * (bones[i].boneLength / toNewLen);
+                else
+                    newTip = root + Vector3(0.0, -bones[i].boneLength, 0.0);
+
+                prevTipPos[i] = tipPos[i];
+                tipPos[i] = newTip;
+
+                out[bones[i].name] = buildBoneWorldTransform(root, newTip);
+            }
+        }
+    };
+
+    // =========================================================================
+    // CAPE GRID SIMULATOR
+    // =========================================================================
+    //
+    // Simulates a cape as a grid of bone chains with horizontal coupling.
+    // The grid has 3 columns (Left, Center, Right) each with 3 bones,
+    // anchored to the Chest bone. Vertical chains use the same Verlet
+    // integration as HairChainSimulator; horizontal distance constraints
+    // couple adjacent columns to maintain surface coherence.
+    //
+    // Bone names: LeftCape1..3, CenterCape1..3, RightCape1..3
+    //
+    // Usage:
+    //   CapeGridSimulator capeSim;
+    //   capeSim.initialize(rig, boneIdx,
+    //       buildBoneWorldTransform(bonePos("Chest"), boneEnd("Chest")),
+    //       stiffness, damping, gravityScale, spreadStiffness);
+    //
+    //   // Inside frame loop, after Chest world transform is known:
+    //   if (capeSim.active)
+    //       capeSim.step(boneWorldTransforms["Chest"], dt, boneWorldTransforms);
+    struct CapeGridSimulator {
+        struct BoneData {
+            std::string name;
+            Vector3 bindRoot;
+            Vector3 bindTip;
+            double boneLength;
+        };
+
+        static constexpr int kColumns = 3;
+        static constexpr int kRows = 3;
+
+        Matrix4x4 parentBindInverse;
+        BoneData bones[kColumns][kRows];
+        Vector3 tipPos[kColumns][kRows];
+        Vector3 prevTipPos[kColumns][kRows];
+        double horizontalRestDist[kRows]; // rest distance between adjacent columns at each row
+        double stiffness = 0.08;
+        double damping = 0.85;
+        double gravityScale = 1.2;
+        double spreadStiffness = 0.15;
+        bool active = false;
+        int activeCols = 0;
+        int activeRows[kColumns] = {};
+
+        void initialize(const RigStructure& rig,
+            const std::map<std::string, size_t>& idx,
+            const Matrix4x4& parentBindTransform,
+            double stiff = 0.08,
+            double damp = 0.85,
+            double grav = 1.2,
+            double spread = 0.15)
+        {
+            stiffness = stiff;
+            damping = damp;
+            gravityScale = grav;
+            spreadStiffness = spread;
+            parentBindInverse = parentBindTransform.inverted();
+
+            static const char* colNames[kColumns] = { "LeftCape", "CenterCape", "RightCape" };
+
+            activeCols = 0;
+            for (int c = 0; c < kColumns; ++c) {
+                activeRows[c] = 0;
+                for (int r = 0; r < kRows; ++r) {
+                    std::string name = std::string(colNames[c]) + std::to_string(r + 1);
+                    auto it = idx.find(name);
+                    if (it == idx.end())
+                        break;
+                    const auto& b = rig.bones[it->second];
+                    bones[c][r].name = name;
+                    bones[c][r].bindRoot = Vector3(b.posX, b.posY, b.posZ);
+                    bones[c][r].bindTip = Vector3(b.endX, b.endY, b.endZ);
+                    bones[c][r].boneLength = (bones[c][r].bindTip - bones[c][r].bindRoot).length();
+                    if (bones[c][r].boneLength < 1e-8)
+                        bones[c][r].boneLength = 1e-8;
+                    tipPos[c][r] = bones[c][r].bindTip;
+                    prevTipPos[c][r] = bones[c][r].bindTip;
+                    activeRows[c] = r + 1;
+                }
+                if (activeRows[c] > 0)
+                    ++activeCols;
+            }
+
+            // Compute horizontal rest distances between adjacent columns
+            for (int r = 0; r < kRows; ++r) {
+                horizontalRestDist[r] = 0.0;
+                int pairs = 0;
+                for (int c = 0; c < kColumns - 1; ++c) {
+                    if (r < activeRows[c] && r < activeRows[c + 1]) {
+                        horizontalRestDist[r] += (bones[c][r].bindTip - bones[c + 1][r].bindTip).length();
+                        ++pairs;
+                    }
+                }
+                if (pairs > 0)
+                    horizontalRestDist[r] /= pairs;
+            }
+
+            active = (activeCols >= 1);
+        }
+
+        void step(const Matrix4x4& parentWorldTransform,
+            double dt,
+            std::map<std::string, Matrix4x4>& out)
+        {
+            if (!active)
+                return;
+
+            Matrix4x4 delta = parentWorldTransform;
+            delta *= parentBindInverse;
+
+            const Vector3 gravityAccel(0.0, -9.8 * gravityScale, 0.0);
+            const double dt2 = dt * dt;
+
+            // Verlet integration for each column (same as hair chain)
+            for (int c = 0; c < kColumns; ++c) {
+                for (int r = 0; r < activeRows[c]; ++r) {
+                    Vector3 root = (r == 0)
+                        ? delta.transformPoint(bones[c][0].bindRoot)
+                        : tipPos[c][r - 1];
+
+                    Vector3 goalTipWorld = delta.transformPoint(bones[c][r].bindTip);
+                    Vector3 goalRootWorld = delta.transformPoint(bones[c][r].bindRoot);
+                    Vector3 goalDir = goalTipWorld - goalRootWorld;
+                    double goalDirLen = goalDir.length();
+                    if (goalDirLen > 1e-8)
+                        goalDir = goalDir * (1.0 / goalDirLen);
+                    else
+                        goalDir = Vector3(0.0, -1.0, 0.0);
+                    Vector3 goalTip = root + goalDir * bones[c][r].boneLength;
+
+                    Vector3 vel = (tipPos[c][r] - prevTipPos[c][r]) * damping;
+                    Vector3 newTip = tipPos[c][r] + vel + gravityAccel * dt2;
+                    newTip = newTip + (goalTip - newTip) * stiffness;
+
+                    Vector3 toNew = newTip - root;
+                    double toNewLen = toNew.length();
+                    if (toNewLen > 1e-8)
+                        newTip = root + toNew * (bones[c][r].boneLength / toNewLen);
+                    else
+                        newTip = root + Vector3(0.0, -bones[c][r].boneLength, 0.0);
+
+                    prevTipPos[c][r] = tipPos[c][r];
+                    tipPos[c][r] = newTip;
+                }
+            }
+
+            // Horizontal distance constraints between adjacent columns
+            static const int kConstraintIters = 3;
+            for (int iter = 0; iter < kConstraintIters; ++iter) {
+                for (int r = 0; r < kRows; ++r) {
+                    for (int c = 0; c < kColumns - 1; ++c) {
+                        if (r >= activeRows[c] || r >= activeRows[c + 1])
+                            continue;
+                        Vector3 diff = tipPos[c + 1][r] - tipPos[c][r];
+                        double dist = diff.length();
+                        if (dist < 1e-8)
+                            continue;
+                        double restDist = horizontalRestDist[r];
+                        double correction = (dist - restDist) / dist * spreadStiffness;
+                        Vector3 offset = diff * (correction * 0.5);
+                        tipPos[c][r] = tipPos[c][r] + offset;
+                        tipPos[c + 1][r] = tipPos[c + 1][r] - offset;
+                    }
+                }
+
+                // Re-enforce length constraints after horizontal correction
+                for (int c = 0; c < kColumns; ++c) {
+                    for (int r = 0; r < activeRows[c]; ++r) {
+                        Vector3 root = (r == 0)
+                            ? delta.transformPoint(bones[c][0].bindRoot)
+                            : tipPos[c][r - 1];
+                        Vector3 toTip = tipPos[c][r] - root;
+                        double len = toTip.length();
+                        if (len > 1e-8)
+                            tipPos[c][r] = root + toTip * (bones[c][r].boneLength / len);
+                        else
+                            tipPos[c][r] = root + Vector3(0.0, -bones[c][r].boneLength, 0.0);
+                    }
+                }
+            }
+
+            // Write output transforms
+            for (int c = 0; c < kColumns; ++c) {
+                for (int r = 0; r < activeRows[c]; ++r) {
+                    Vector3 root = (r == 0)
+                        ? delta.transformPoint(bones[c][0].bindRoot)
+                        : tipPos[c][r - 1];
+                    out[bones[c][r].name] = buildBoneWorldTransform(root, tipPos[c][r]);
+                }
+            }
+        }
+    };
+
+    // =========================================================================
+    // EYELID BLINK
+    // =========================================================================
+
+    // Apply a single blink to eyelid bones during the animation cycle.
+    // Call this per-frame after other bone transforms are computed.
+    // blinkTime: normalized time in [0,1] when the blink occurs
+    // blinkDuration: fraction of cycle the blink takes
+    inline void applyEyelidBlink(const RigStructure& rig,
+        const std::map<std::string, size_t>& boneIdx,
+        const std::map<std::string, Matrix4x4>& inverseBindMatrices,
+        std::map<std::string, Matrix4x4>& boneWorldTransforms,
+        std::map<std::string, Matrix4x4>& boneSkinMatrices,
+        float tNormalized,
+        float blinkTime = 0.5f,
+        float blinkDuration = 0.1f)
+    {
+        // Need at least one upper+lower pair
+        bool hasLeft = boneIdx.count("LeftUpperEyelid") && boneIdx.count("LeftLowerEyelid");
+        bool hasRight = boneIdx.count("RightUpperEyelid") && boneIdx.count("RightLowerEyelid");
+        if (!hasLeft && !hasRight)
+            return;
+
+        // Compute blink factor: 0 = open, 1 = closed
+        float blinkFactor = 0.0f;
+        float halfDur = blinkDuration * 0.5f;
+        float dt = tNormalized - blinkTime;
+        // Wrap around for blinks near cycle boundaries
+        if (dt > 0.5f)
+            dt -= 1.0f;
+        if (dt < -0.5f)
+            dt += 1.0f;
+        float absDt = std::abs(dt);
+        if (absDt < halfDur) {
+            float t = 1.0f - (absDt / halfDur);
+            blinkFactor = (float)smoothstep(t);
+        }
+
+        // Eyelid bones must follow the Head every frame (not just during blink).
+        // To avoid any numerical offset, we derive the eyelid's rest-pose world
+        // transform from its own inverse bind matrix (guaranteed exact match),
+        // then apply the Head's animation delta on top.
+        auto headWorldIt = boneWorldTransforms.find("Head");
+        if (headWorldIt == boneWorldTransforms.end())
+            return;
+
+        // Head's rest-pose world transform from its inverse bind matrix
+        auto headInvBindIt = inverseBindMatrices.find("Head");
+        if (headInvBindIt == inverseBindMatrices.end())
+            return;
+
+        // Delta = animatedHead * inverse(restHead)
+        Matrix4x4 headDelta = headWorldIt->second;
+        headDelta *= headInvBindIt->second;
+
+        // For blink, rotate each lid around the bone direction (the hinge axis).
+        // The bone direction is set by the rig generator to be horizontal and
+        // perpendicular to the outward eye normal, so rotating around it sweeps
+        // the lid over the eyeball naturally.
+        // Each bone stores its own closingAngle computed from the actual geometry,
+        // guaranteeing the eye fully closes at blinkFactor=1.
+        const char* eyelidNames[] = {
+            "LeftUpperEyelid",
+            "LeftLowerEyelid",
+            "RightUpperEyelid",
+            "RightLowerEyelid",
+        };
+
+        for (const char* eyelidName : eyelidNames) {
+            auto it = boneIdx.find(eyelidName);
+            if (it == boneIdx.end())
+                continue;
+
+            auto invIt = inverseBindMatrices.find(eyelidName);
+            if (invIt == inverseBindMatrices.end())
+                continue;
+
+            Matrix4x4 eyelidRestTransform = invIt->second.inverted();
+
+            Matrix4x4 transform = headDelta;
+            transform *= eyelidRestTransform;
+
+            if (blinkFactor > 0.001f) {
+                const auto& bone = rig.bones[it->second];
+                Vector3 boneDir(bone.endX - bone.posX, bone.endY - bone.posY, bone.endZ - bone.posZ);
+                if (!boneDir.isZero() && std::abs(bone.closingAngle) > 1e-6f) {
+                    Vector3 boneMid(
+                        (bone.posX + bone.endX) * 0.5,
+                        (bone.posY + bone.endY) * 0.5,
+                        (bone.posZ + bone.endZ) * 0.5);
+
+                    Vector3 animatedPivot = headDelta.transformPoint(boneMid);
+                    Vector3 animatedAxis = headDelta.transformVector(boneDir.normalized());
+                    animatedAxis.normalize();
+
+                    float lidAngle = blinkFactor * bone.closingAngle;
+
+                    Matrix4x4 blinkTransform;
+                    blinkTransform.translate(animatedPivot);
+                    Quaternion blinkRot = Quaternion::fromAxisAndAngle(animatedAxis, lidAngle);
+                    blinkTransform.rotate(blinkRot);
+                    blinkTransform.translate(Vector3(-animatedPivot.x(), -animatedPivot.y(), -animatedPivot.z()));
+
+                    transform = blinkTransform;
+                    transform *= headDelta;
+                    transform *= eyelidRestTransform;
+                }
+            }
+
+            boneWorldTransforms[eyelidName] = transform;
+
+            Matrix4x4 skin = transform;
+            skin *= invIt->second;
+            boneSkinMatrices[eyelidName] = skin;
+        }
+    }
+
 } // namespace animation
 } // namespace dust3d
 

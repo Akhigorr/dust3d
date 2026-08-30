@@ -2,9 +2,11 @@
 #include "image_forever.h"
 #include <QPainter>
 #include <QTransform>
+#include <cmath>
 #include <dust3d/base/part_target.h>
 #include <dust3d/uv/uv_map_packer.h>
 #include <map>
+#include <queue>
 #include <unordered_set>
 
 size_t UvMapGenerator::m_textureSize = 4096;
@@ -199,6 +201,54 @@ void UvMapGenerator::packUvs()
         m_mapPacker->addPart(seamPart);
     }
 
+    // Lookup from quantized vertex position back to its 3D coordinate so we can
+    // measure the surface area of image-less charts.  The keys in componentTriangleUvs
+    // were built from these same vertex positions, so the quantization matches.
+    std::map<dust3d::PositionKey, dust3d::Vector3> positionKeyToVertex;
+    for (const auto& vertex : m_object->vertices)
+        positionKeyToVertex.insert({ dust3d::PositionKey(vertex), vertex });
+    auto sumTriangleArea = [&](const std::map<std::array<dust3d::PositionKey, 3>, std::array<dust3d::Vector2, 3>>& localUv) -> double {
+        double total = 0.0;
+        for (const auto& it : localUv) {
+            auto findA = positionKeyToVertex.find(it.first[0]);
+            auto findB = positionKeyToVertex.find(it.first[1]);
+            auto findC = positionKeyToVertex.find(it.first[2]);
+            if (findA == positionKeyToVertex.end() || findB == positionKeyToVertex.end() || findC == positionKeyToVertex.end())
+                continue;
+            total += dust3d::Vector3::area(findA->second, findB->second, findC->second);
+        }
+        return total;
+    };
+    auto componentColorImage = [&](const std::map<std::string, std::string>& component) -> const QImage* {
+        const auto& colorImageIdIt = component.find("colorImageId");
+        if (colorImageIdIt == component.end())
+            return nullptr;
+        return ImageForever::get(dust3d::Uuid(colorImageIdIt->second));
+    };
+
+    // A part with a texture image occupies a chart sized to the image resolution.  A
+    // part without one used to fall back to a fixed 1x1 chart, which collapsed to a
+    // near-invisible sliver of the atlas when packed alongside image-based charts.
+    // Instead, give each image-less chart an area proportional to the 3D surface area
+    // of its triangles, normalized so that all image-less charts together fill about
+    // one texture's worth of texels.  This keeps texel density consistent and is
+    // invariant to the model's absolute scale.
+    double totalImagelessArea = 0.0;
+    std::map<dust3d::Uuid, double> componentImagelessArea;
+    for (const auto& componentTriangleUvIt : m_object->componentTriangleUvs) {
+        auto componentIt = m_snapshot->components.find(componentTriangleUvIt.first.toString());
+        if (componentIt == m_snapshot->components.end())
+            continue;
+        if (nullptr != componentColorImage(componentIt->second))
+            continue;
+        double area = sumTriangleArea(componentTriangleUvIt.second);
+        componentImagelessArea[componentTriangleUvIt.first] = area;
+        totalImagelessArea += area;
+    }
+    const double imagelessSizeScale = totalImagelessArea > 0.0
+        ? (double)UvMapGenerator::m_textureSize / std::sqrt(totalImagelessArea)
+        : 1.0;
+
     for (const auto& componentTriangleUvIt : m_object->componentTriangleUvs) {
         auto componentIt = m_snapshot->components.find(componentTriangleUvIt.first.toString());
         if (componentIt == m_snapshot->components.end())
@@ -211,14 +261,18 @@ void UvMapGenerator::packUvs()
         if (colorIt != componentIt->second.end()) {
             color = dust3d::Color(colorIt->second);
         }
-        const auto& colorImageIdIt = componentIt->second.find("colorImageId");
-        if (colorImageIdIt != componentIt->second.end()) {
+        const QImage* image = componentColorImage(componentIt->second);
+        if (nullptr != image) {
+            const auto& colorImageIdIt = componentIt->second.find("colorImageId");
             imageId = dust3d::Uuid(colorImageIdIt->second);
-            const QImage* image = ImageForever::get(imageId);
-            if (nullptr != image) {
-                width = image->width();
-                height = image->height();
-            }
+            width = image->width();
+            height = image->height();
+        } else {
+            // Image-less chart: size it by surface area so it keeps a fair share of the atlas.
+            double area = componentImagelessArea[componentTriangleUvIt.first];
+            double side = std::max(1.0, std::sqrt(area) * imagelessSizeScale);
+            width = side;
+            height = side;
         }
         dust3d::UvMapPacker::Part part;
         part.id = imageId;
@@ -260,7 +314,7 @@ void UvMapGenerator::packUvs()
 void UvMapGenerator::generateTextureColorImage()
 {
     m_textureColorImage = std::make_unique<QImage>(UvMapGenerator::m_textureSize, UvMapGenerator::m_textureSize, QImage::Format_ARGB32);
-    m_textureColorImage->fill(Qt::white);
+    m_textureColorImage->fill(QColor(0, 255, 0, 0));
 
     QPainter colorTexturePainter;
     colorTexturePainter.begin(m_textureColorImage.get());
@@ -277,10 +331,12 @@ void UvMapGenerator::generateTextureColorImage()
     const int bleedPixels = 32;
 
     for (const auto& layout : m_mapPacker->packedLayouts()) {
+        int chartW = (int)(layout.width * UvMapGenerator::m_textureSize);
+        int chartH = (int)(layout.height * UvMapGenerator::m_textureSize);
         QPixmap brushPixmap;
         if (layout.id.isNull()) {
-            brushPixmap = QPixmap(layout.width * UvMapGenerator::m_textureSize + bleedPixels * 2,
-                layout.height * UvMapGenerator::m_textureSize + bleedPixels * 2);
+            // Solid colour: fill the exact chart area plus bleed border
+            brushPixmap = QPixmap(chartW + bleedPixels * 2, chartH + bleedPixels * 2);
             brushPixmap.fill(QColor(QString::fromStdString(layout.color.toString())));
         } else {
             const QImage* image = ImageForever::get(layout.id);
@@ -288,19 +344,41 @@ void UvMapGenerator::generateTextureColorImage()
                 dust3dDebug << "Find image failed:" << layout.id.toString();
                 continue;
             }
+            // Build the padded pixmap in two layers:
+            //   Layer 1 (bleed)  – image stretched to the full padded size so the bleed
+            //                      region is filled with approximate edge content instead
+            //                      of the white atlas background, preventing seam artefacts.
+            //   Layer 2 (chart)  – image scaled to exactly chartW×chartH and drawn at
+            //                      (bleedPixels, bleedPixels), so the UV-mapped region
+            //                      receives the correct, undistorted texture.
             if (layout.flipped) {
-                auto scaledImage = image->scaled(QSize(layout.height * UvMapGenerator::m_textureSize + bleedPixels * 2,
-                    layout.width * UvMapGenerator::m_textureSize + bleedPixels * 2));
+                auto scaledImage = image->scaled(QSize(chartH, chartW));
                 QPoint center = scaledImage.rect().center();
                 QTransform matrix;
                 matrix.translate(center.x(), center.y());
                 matrix.rotate(90);
                 auto rotatedImage = scaledImage.transformed(matrix).mirrored(true, false);
-                brushPixmap = QPixmap::fromImage(rotatedImage);
+                brushPixmap = QPixmap(chartW + bleedPixels * 2, chartH + bleedPixels * 2);
+                // Layer 1: stretched bleed
+                auto bleedImage = image->scaled(QSize(chartH + bleedPixels * 2, chartW + bleedPixels * 2));
+                QPoint bleedCenter = bleedImage.rect().center();
+                QTransform bleedMatrix;
+                bleedMatrix.translate(bleedCenter.x(), bleedCenter.y());
+                bleedMatrix.rotate(90);
+                auto bleedRotated = bleedImage.transformed(bleedMatrix).mirrored(true, false);
+                QPainter padPainter(&brushPixmap);
+                padPainter.drawImage(0, 0, bleedRotated);
+                // Layer 2: exact-scale chart content
+                padPainter.drawImage(bleedPixels, bleedPixels, rotatedImage);
             } else {
-                auto scaledImage = image->scaled(QSize(layout.width * UvMapGenerator::m_textureSize + bleedPixels * 2,
-                    layout.height * UvMapGenerator::m_textureSize + bleedPixels * 2));
-                brushPixmap = QPixmap::fromImage(scaledImage);
+                brushPixmap = QPixmap(chartW + bleedPixels * 2, chartH + bleedPixels * 2);
+                // Layer 1: stretched bleed
+                auto bleedImage = image->scaled(QSize(chartW + bleedPixels * 2, chartH + bleedPixels * 2));
+                QPainter padPainter(&brushPixmap);
+                padPainter.drawImage(0, 0, bleedImage);
+                // Layer 2: exact-scale chart content
+                auto scaledImage = image->scaled(QSize(chartW, chartH));
+                padPainter.drawImage(bleedPixels, bleedPixels, scaledImage);
             }
         }
         colorTexturePainter.drawPixmap(layout.left * UvMapGenerator::m_textureSize - bleedPixels,
@@ -309,6 +387,61 @@ void UvMapGenerator::generateTextureColorImage()
     }
 
     colorTexturePainter.end();
+
+    dilateTexture(m_textureColorImage.get());
+}
+
+void UvMapGenerator::dilateTexture(QImage* image)
+{
+    const int w = image->width();
+    const int h = image->height();
+    const QRgb emptyPixel = qRgba(0, 255, 0, 0);
+
+    std::vector<bool> filled(w * h, false);
+    std::queue<int> frontier;
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            if (image->pixel(x, y) != emptyPixel) {
+                filled[y * w + x] = true;
+                bool onBorder = false;
+                if (x > 0 && image->pixel(x - 1, y) == emptyPixel)
+                    onBorder = true;
+                else if (x < w - 1 && image->pixel(x + 1, y) == emptyPixel)
+                    onBorder = true;
+                else if (y > 0 && image->pixel(x, y - 1) == emptyPixel)
+                    onBorder = true;
+                else if (y < h - 1 && image->pixel(x, y + 1) == emptyPixel)
+                    onBorder = true;
+                if (onBorder)
+                    frontier.push(y * w + x);
+            }
+        }
+    }
+
+    const int dx[] = { -1, 1, 0, 0 };
+    const int dy[] = { 0, 0, -1, 1 };
+
+    while (!frontier.empty()) {
+        int idx = frontier.front();
+        frontier.pop();
+        int cx = idx % w;
+        int cy = idx / w;
+        QRgb color = image->pixel(cx, cy);
+
+        for (int d = 0; d < 4; ++d) {
+            int nx = cx + dx[d];
+            int ny = cy + dy[d];
+            if (nx < 0 || nx >= w || ny < 0 || ny >= h)
+                continue;
+            int nidx = ny * w + nx;
+            if (!filled[nidx]) {
+                filled[nidx] = true;
+                image->setPixel(nx, ny, color);
+                frontier.push(nidx);
+            }
+        }
+    }
 }
 
 void UvMapGenerator::generateUvCoords()

@@ -6,9 +6,11 @@
 #include <dust3d/base/part_target.h>
 #include <dust3d/base/uuid.h>
 #include <memory>
+#include <set>
 
 class Document;
 class ComponentPreviewGridWidget;
+class ComponentBreadcrumbWidget;
 class ComponentPropertyWidget;
 class QPushButton;
 
@@ -29,6 +31,7 @@ signals:
 public slots:
     void selectComponentByPartId(const dust3d::Uuid& partId);
     void showSelectedComponentProperties();
+    void showComponentPropertyForParts(std::set<dust3d::Uuid> partIds);
     void showContextMenu(const QPoint& pos);
 
 public:
@@ -37,6 +40,7 @@ public:
 private:
     Document* m_document = nullptr;
     ComponentPreviewGridWidget* m_componentPreviewGridWidget = nullptr;
+    ComponentBreadcrumbWidget* m_breadcrumbWidget = nullptr;
     QPushButton* m_levelUpButton = nullptr;
     QPushButton* m_selectButton = nullptr;
     QPushButton* m_lockButton = nullptr;
