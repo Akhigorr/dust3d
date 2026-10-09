@@ -20,7 +20,9 @@
  *  SOFTWARE.
  */
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <dust3d/base/cut_face.h>
 #include <dust3d/base/part_target.h>
 #include <dust3d/base/snapshot_xml.h>
@@ -36,9 +38,14 @@
 #include <dust3d/mesh/trim_vertices.h>
 #include <dust3d/mesh/tube_mesh_builder.h>
 #include <dust3d/rig/rig_generator.h>
+#include <dust3d/uv/cloth_folds.h>
+#include <dust3d/uv/surface_pattern.h>
 #include <functional>
+#include <iostream>
 #include <limits>
+#include <locale>
 #include <memory>
+#include <sstream>
 
 namespace dust3d {
 
@@ -78,6 +85,11 @@ bool MeshGenerator::isSuccessful()
 const std::set<Uuid>& MeshGenerator::generatedPreviewComponentIds()
 {
     return m_generatedPreviewComponentIds;
+}
+
+const std::map<Uuid, MeshGenerator::ComponentPreview>& MeshGenerator::generatedComponentPreviews()
+{
+    return m_generatedComponentPreviews;
 }
 
 Object* MeshGenerator::takeObject()
@@ -263,6 +275,30 @@ bool MeshGenerator::checkIsComponentDirty(const std::string& componentIdString)
 void MeshGenerator::checkDirtyFlags()
 {
     checkIsComponentDirty(to_string(Uuid()));
+
+    // A garment that takes its skin weights from another group (wrapBindTo) changes when
+    // that group changes, though it is not one of its children.
+    std::map<std::string, std::string> parentMap;
+    for (const auto& componentIt : m_snapshot->components) {
+        for (const auto& childId : String::split(String::valueOrEmpty(componentIt.second, "children"), ','))
+            parentMap[childId] = componentIt.first;
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const auto& componentIt : m_snapshot->components) {
+            std::string bindTo = String::valueOrEmpty(componentIt.second, "wrapBindTo");
+            if (bindTo.empty() || m_dirtyComponentIds.find(bindTo) == m_dirtyComponentIds.end())
+                continue;
+            if (m_dirtyComponentIds.find(componentIt.first) != m_dirtyComponentIds.end())
+                continue;
+            for (std::string id = componentIt.first; !id.empty();) {
+                m_dirtyComponentIds.insert(id);
+                auto findParent = parentMap.find(id);
+                id = findParent == parentMap.end() ? std::string() : findParent->second;
+            }
+            changed = true;
+        }
+    }
 }
 
 void MeshGenerator::cutFaceStringToCutTemplate(const std::string& cutFaceString, std::vector<Vector2>& cutTemplate)
@@ -437,6 +473,13 @@ bool MeshGenerator::fetchPartOrderedNodes(const std::string& partIdString, bool 
         builderNodeIdStringToIndexMap.insert({ nodeIdString, builderNodes.size() });
         builderNodes.emplace_back(MeshNode {
             Vector3((double)x, (double)y, (double)z), (double)radius, Uuid(xMirrored ? String::valueOrEmpty(node, "__mirroredByNodeId") : nodeIdString) });
+        // optional per-node cross-section scale (see MeshNode)
+        std::string nodeDeformWidth = String::valueOrEmpty(node, "deformWidth");
+        if (!nodeDeformWidth.empty() && String::toFloat(nodeDeformWidth) > 0)
+            builderNodes.back().deformWidth = String::toFloat(nodeDeformWidth);
+        std::string nodeDeformThickness = String::valueOrEmpty(node, "deformThickness");
+        if (!nodeDeformThickness.empty() && String::toFloat(nodeDeformThickness) > 0)
+            builderNodes.back().deformThickness = String::toFloat(nodeDeformThickness);
     }
 
     if (builderNodes.empty()) {
@@ -841,6 +884,10 @@ std::unique_ptr<MeshState> MeshGenerator::combinePartMesh(const std::string& par
     }
 
     bool deformUnified = String::isTrue(String::valueOrEmpty(part, "deformUnified"));
+    // "interpolated" = "false" keeps only the part's own nodes as rings (no extra rings along
+    // long edges): far fewer triangles for rigid thin parts such as grass blades and stakes.
+    std::string interpolatedString = String::valueOrEmpty(part, "interpolated");
+    bool interpolated = interpolatedString.empty() || String::isTrue(interpolatedString);
 
     float metalness = 0;
     std::string metalnessString = String::valueOrEmpty(part, "metallic");
@@ -883,6 +930,7 @@ std::unique_ptr<MeshState> MeshGenerator::combinePartMesh(const std::string& par
         buildParameters.baseNormalRotation = cutRotation * Math::Pi;
         buildParameters.cutFace = cutTemplate;
         buildParameters.frontEndRounded = buildParameters.backEndRounded = rounded;
+        buildParameters.interpolationEnabled = interpolated;
         tubeMeshBuilder = std::make_unique<TubeMeshBuilder>(buildParameters, std::move(meshNodes), isCircle);
         tubeMeshBuilder->build();
         partCache.vertices = tubeMeshBuilder->generatedVertices();
@@ -1056,6 +1104,14 @@ std::unique_ptr<MeshState> MeshGenerator::combinePartMesh(const std::string& par
         preview.metalness = partCache.metalness;
         preview.roughness = partCache.roughness;
         preview.triangleUvs = partCache.triangleUvs;
+        if (!partCache.importedVertexColorMap.empty()) {
+            for (const auto& vertex : preview.vertices) {
+                auto findColor = partCache.importedVertexColorMap.find(vertex);
+                preview.vertexProperties.emplace_back(
+                    findColor == partCache.importedVertexColorMap.end() ? preview.color : findColor->second,
+                    preview.metalness, preview.roughness);
+            }
+        }
         addComponentPreview(componentIdString, std::move(preview));
     } else if (PartTarget::CutFace == target) {
         ComponentPreview preview;
@@ -1138,8 +1194,14 @@ std::unique_ptr<MeshState> MeshGenerator::combineComponentMesh(const std::string
 
     if (m_cacheEnabled) {
         if (m_dirtyComponentIds.find(componentIdString) == m_dirtyComponentIds.end()) {
-            if (nullptr != componentCache.mesh)
+            if (nullptr != componentCache.mesh) {
+                if (!componentCache.wrapColor.empty() && String::valueOrEmpty(*component, "color").empty())
+                    m_snapshot->components[componentIdString]["color"] = componentCache.wrapColor;
+                if (!componentCache.wrapFolds.empty())
+                    m_snapshot->components[componentIdString]["__wrapFolds"] = componentCache.wrapFolds;
+                m_generatedComponentIds.insert(componentIdString);
                 return std::make_unique<MeshState>(*componentCache.mesh);
+            }
         }
     }
 
@@ -1172,6 +1234,10 @@ std::unique_ptr<MeshState> MeshGenerator::combineComponentMesh(const std::string
             if (mesh)
                 mesh.reset();
         }
+    } else if (isWrapComponent(component) && !wrapKeepsChildren(component)) {
+        // The children are wrapped by one new surface, which replaces them (a creature
+        // skin over bones and muscle shapes, or a garment over guide shapes).
+        mesh = buildWrapMesh(componentIdString, *component, color, smoothCutoffDegrees, componentCache);
     } else {
         std::vector<std::pair<CombineMode, std::vector<std::string>>> combineGroups;
         int currentGroupIndex = -1;
@@ -1261,28 +1327,134 @@ std::unique_ptr<MeshState> MeshGenerator::combineComponentMesh(const std::string
             }
         }
         mesh = combineMultipleMeshes(std::move(groupMeshes), &componentCache.brokenTriangles);
-        ComponentPreview preview;
-        if (mesh) {
-            mesh->fetch(preview.vertices, preview.triangles);
-            preview.color = color;
-            if (!stitchingParts.empty() || !stitchingLoopParts.empty()) {
-                for (const auto& it : componentCache.componentTriangleUvs) {
-                    for (const auto& uvs : it.second)
-                        preview.triangleUvs.insert(uvs);
-                }
-            }
+        if (isWrapComponent(component)) {
+            // The children stay (a garment over the body), the wrap surface is emitted next to them.
+            componentCache.wrapOutput = std::make_unique<GeneratedComponent>();
+            componentCache.wrapOutput->mesh = buildWrapMesh(componentIdString, *component, color, smoothCutoffDegrees, *componentCache.wrapOutput);
         }
-        addComponentPreview(componentId, std::move(preview));
     }
 
     if (nullptr != mesh)
         componentCache.mesh = std::make_unique<MeshState>(*mesh);
+    if ("partId" != linkDataType) {
+        ComponentPreview preview;
+        preview.color = color;
+        collectComponentPreview(componentIdString, true, preview);
+        addComponentPreview(componentId, std::move(preview));
+    }
+    m_generatedComponentIds.insert(componentIdString);
 
     if (nullptr != mesh && mesh->isNull()) {
         mesh.reset();
     }
 
     return mesh;
+}
+
+bool MeshGenerator::seamReportEnabled()
+{
+    // Opt-in diagnostics for tools: DUST3D_SEAM_REPORT=1 prints one SEAM_REPORT line per union
+    // to stdout. Unset, empty, "0", "false" or "off" keep it disabled. Read once per process.
+    static const bool enabled = []() {
+        const char* value = std::getenv("DUST3D_SEAM_REPORT");
+        if (nullptr == value)
+            return false;
+        std::string text(value);
+        return !(text.empty() || "0" == text || "false" == text || "off" == text);
+    }();
+    return enabled;
+}
+
+std::string MeshGenerator::componentDisplayName(const std::string& componentIdString)
+{
+    auto findComponent = m_snapshot->components.find(componentIdString);
+    if (findComponent == m_snapshot->components.end())
+        return componentIdString;
+    std::string name = String::valueOrEmpty(findComponent->second, "name");
+    if (name.empty())
+        name = componentIdString;
+    if ("partId" == String::valueOrEmpty(findComponent->second, "linkDataType")) {
+        auto findPart = m_snapshot->parts.find(String::valueOrEmpty(findComponent->second, "linkData"));
+        if (findPart != m_snapshot->parts.end() && !String::valueOrEmpty(findPart->second, "__mirrorFromPartId").empty())
+            name += "~mirror";
+    }
+    return name;
+}
+
+std::string MeshGenerator::seamReportNames(const std::string& subMeshIdString)
+{
+    std::string names;
+    for (const auto& idString : String::split(subMeshIdString, '|')) {
+        for (const auto& id : String::split(idString, ':')) {
+            if (id.empty())
+                continue;
+            if (!names.empty())
+                names += "|";
+            std::string name = componentDisplayName(id);
+            for (auto& c : name) {
+                if (' ' == c)
+                    c = '_';
+            }
+            names += name;
+        }
+    }
+    return names;
+}
+
+void MeshGenerator::reportFailedCombine(const std::string& subMeshIdString, const std::string& method)
+{
+    // The boolean failed (usually coincident or grazing surfaces) and the parts were dropped:
+    // SEAM_REPORT <method> <joined component names> failed
+    std::cout << "SEAM_REPORT " << method << " " << seamReportNames(subMeshIdString) << " failed" << std::endl;
+}
+
+void MeshGenerator::reportSeams(const std::string& subMeshIdString, const std::string& method,
+    const std::vector<MeshRecombiner::SeamReport>& reports)
+{
+    // One machine-readable line per combine, for tools that check seam quality:
+    // SEAM_REPORT <method> <joined component names> <island count> [island ...]
+    // island = bridged,firstLoops,secondLoops,firstLoopVertices,secondLoopVertices,x,y,z,radius,
+    //          bridgeTriangles,bridgeMinAngle,bridgeMaxFan,bridgeMaxWidth,firstLoopEdgeLength,secondLoopEdgeLength
+    std::ostringstream line;
+    line.imbue(std::locale::classic());
+    line << "SEAM_REPORT " << method << " " << seamReportNames(subMeshIdString) << " " << reports.size();
+    for (const auto& it : reports) {
+        line << " " << (it.bridged ? 1 : 0) << "," << it.firstLoops << "," << it.secondLoops << ","
+             << it.firstLoopVertices << "," << it.secondLoopVertices << ","
+             << it.center.x() << "," << it.center.y() << "," << it.center.z() << "," << it.radius << ","
+             << it.bridgeTriangles << "," << it.bridgeMinAngle << "," << it.bridgeMaxFan << "," << it.bridgeMaxWidth << ","
+             << it.firstLoopEdgeLength << "," << it.secondLoopEdgeLength;
+    }
+    std::cout << line.str() << std::endl;
+}
+
+bool MeshGenerator::isHardComponent(const std::string& componentIdString, int depth)
+{
+    // A part component is hard when its part says "hard" = "true". A group is hard when it
+    // says so itself, or when every child in it is hard.
+    if (depth > 64)
+        return false;
+    auto findComponent = m_snapshot->components.find(componentIdString);
+    if (findComponent == m_snapshot->components.end())
+        return false;
+    const auto& component = findComponent->second;
+    if (String::isTrue(String::valueOrEmpty(component, "hard")))
+        return true;
+    std::string linkDataType = String::valueOrEmpty(component, "linkDataType");
+    if ("partId" == linkDataType) {
+        auto findPart = m_snapshot->parts.find(String::valueOrEmpty(component, "linkData"));
+        return findPart != m_snapshot->parts.end() && String::isTrue(String::valueOrEmpty(findPart->second, "hard"));
+    }
+    auto children = String::split(String::valueOrEmpty(component, "children"), ',');
+    bool any = false;
+    for (const auto& childId : children) {
+        if (childId.empty())
+            continue;
+        if (!isHardComponent(childId, depth + 1))
+            return false;
+        any = true;
+    }
+    return any;
 }
 
 std::unique_ptr<MeshState> MeshGenerator::combineMultipleMeshes(std::vector<std::tuple<std::unique_ptr<MeshState>, CombineMode, std::string>>&& multipleMeshes,
@@ -1312,13 +1484,24 @@ std::unique_ptr<MeshState> MeshGenerator::combineMultipleMeshes(std::vector<std:
                 newMesh = std::make_unique<MeshState>(*findCached->second);
             }
         } else {
+            // a hard-surface part (or a group of them) joins with a crisp boolean edge
+            bool hard = isHardComponent(subMeshIdString);
             newMesh = MeshState::combine(*mesh,
                 *subMesh,
-                combinerMethod);
+                combinerMethod,
+                !hard);
             if (nullptr != newMesh)
                 m_cacheContext->cachedCombination.insert({ meshIdStrings, std::make_unique<MeshState>(*newMesh) });
             else
                 m_cacheContext->cachedCombination.insert({ meshIdStrings, nullptr });
+        }
+        if (seamReportEnabled()) {
+            if (newMesh && !newMesh->isNull() && isHardComponent(subMeshIdString))
+                std::cout << "SEAM_REPORT " << combinerMethodString << " " << seamReportNames(subMeshIdString) << " hard" << std::endl;
+            else if (newMesh && !newMesh->isNull())
+                reportSeams(subMeshIdString, combinerMethodString, newMesh->seamReports);
+            else
+                reportFailedCombine(subMeshIdString, combinerMethodString);
         }
         if (newMesh && !newMesh->isNull()) {
             if (nullptr != brokenTriangles) {
@@ -1367,6 +1550,10 @@ std::unique_ptr<MeshState> MeshGenerator::combineComponentChildGroupMesh(const s
             componentCache.importedVertexColorMap.emplace(it);
         for (const auto& it : childComponentCache.importedTriangleNormals)
             componentCache.importedTriangleNormals.emplace(it);
+        for (const auto& it : childComponentCache.positionToNodeWeights)
+            componentCache.positionToNodeWeights.emplace(it);
+        for (const auto& it : childComponentCache.positionToVertexAttribute)
+            componentCache.positionToVertexAttribute.emplace(it);
         if (nullptr == subMesh || subMesh->isNull()) {
             continue;
         }
@@ -1415,8 +1602,14 @@ void MeshGenerator::postprocessObject(Object* object)
     object->vertexSmoothCutoffDegrees.resize(object->vertices.size(), 0.0f);
     for (size_t i = 0; i < object->vertices.size(); ++i) {
         auto findSourceNode = object->positionToNodeIdMap.find(object->vertices[i]);
-        if (findSourceNode == object->positionToNodeIdMap.end())
+        if (findSourceNode == object->positionToNodeIdMap.end()) {
+            auto findAttribute = object->positionToVertexAttribute.find(object->vertices[i]);
+            if (findAttribute != object->positionToVertexAttribute.end()) {
+                object->vertexColors[i] = findAttribute->second.color;
+                object->vertexSmoothCutoffDegrees[i] = findAttribute->second.smoothCutoffDegrees;
+            }
             continue;
+        }
         auto findObjectNode = object->nodeMap.find(findSourceNode->second);
         if (findObjectNode == object->nodeMap.end())
             continue;
@@ -1472,7 +1665,7 @@ void MeshGenerator::postprocessObject(Object* object)
     object->setTriangleVertexNormals(triangleVertexNormals);
 }
 
-void MeshGenerator::collectIncombinableMesh(const MeshState* mesh, const GeneratedComponent& componentCache)
+void MeshGenerator::collectIncombinableMesh(const MeshState* mesh, const GeneratedComponent& componentCache, const Uuid& componentId)
 {
     if (nullptr == mesh)
         return;
@@ -1496,12 +1689,26 @@ void MeshGenerator::collectIncombinableMesh(const MeshState* mesh, const Generat
 
     for (const auto& it : componentCache.componentTriangleUvs)
         m_object->componentTriangleUvs.insert({ it.first, it.second });
+    for (const auto& it : m_snapshot->components) {
+        std::string name = String::valueOrEmpty(it.second, "name");
+        if (!name.empty())
+            m_object->componentNames[Uuid(it.first)] = name;
+    }
     for (const auto& it : componentCache.positionToNodeIdMap)
         m_object->positionToNodeIdMap.emplace(it);
     for (const auto& it : componentCache.nodeMap)
         m_object->nodeMap.emplace(it);
+    for (const auto& it : componentCache.positionToNodeWeights)
+        m_object->positionToNodeWeights.emplace(it);
+    for (const auto& it : componentCache.positionToVertexAttribute)
+        m_object->positionToVertexAttribute.emplace(it);
 
     m_object->vertices.insert(m_object->vertices.end(), uncombinedVertices.begin(), uncombinedVertices.end());
+    // Uncombined parts are kept whole, so their triangles are known to be theirs: record it
+    // (the UV generator places the rest by position, which cannot tell apart two parts that
+    // overlap exactly, e.g. equipment variants in the same place).
+    m_object->triangleComponentIds.resize(m_object->triangles.size());
+    m_object->triangleComponentIds.insert(m_object->triangleComponentIds.end(), uncombinedFaces.size(), componentId);
     m_object->triangles.insert(m_object->triangles.end(), uncombinedFaces.begin(), uncombinedFaces.end());
     m_object->triangleAndQuads.insert(m_object->triangleAndQuads.end(), uncombinedTriangleAndQuads.begin(), uncombinedTriangleAndQuads.end());
 }
@@ -1509,19 +1716,453 @@ void MeshGenerator::collectIncombinableMesh(const MeshState* mesh, const Generat
 void MeshGenerator::collectUncombinedComponent(const std::string& componentIdString)
 {
     const auto& component = findComponent(componentIdString);
-    if (CombineMode::Uncombined == componentCombineMode(component)) {
-        const auto& componentCache = m_cacheContext->components[componentIdString];
-        if (nullptr == componentCache.mesh || componentCache.mesh->isNull()) {
-            return;
-        }
-        collectIncombinableMesh(componentCache.mesh.get(), componentCache);
+    if (nullptr == component)
         return;
+    bool isWrap = isWrapComponent(component);
+    const auto& componentCache = m_cacheContext->components[componentIdString];
+    if (isWrap && componentCache.wrapOutput && componentCache.wrapOutput->mesh && !componentCache.wrapOutput->mesh->isNull())
+        collectIncombinableMesh(componentCache.wrapOutput->mesh.get(), *componentCache.wrapOutput, Uuid(componentIdString));
+    if (CombineMode::Uncombined == componentCombineMode(component)) {
+        if (nullptr != componentCache.mesh && !componentCache.mesh->isNull()) {
+            bool isPart = "partId" == String::valueOrEmpty(*component, "linkDataType");
+            bool isSkin = isWrap && !wrapKeepsChildren(component);
+            collectIncombinableMesh(componentCache.mesh.get(), componentCache, (isPart || isSkin) ? Uuid(componentIdString) : Uuid());
+        }
+        // a wrap component still lets its own uncombined children through (eyes in a skin)
+        if (!isWrap)
+            return;
     }
     for (const auto& childIdString : String::split(String::valueOrEmpty(*component, "children"), ',')) {
         if (childIdString.empty())
             continue;
         collectUncombinedComponent(childIdString);
     }
+}
+
+bool MeshGenerator::isWrapComponent(const std::map<std::string, std::string>* component)
+{
+    if (nullptr == component)
+        return false;
+    if ("partId" == String::valueOrEmpty(*component, "linkDataType"))
+        return false;
+    std::string wrap = String::valueOrEmpty(*component, "wrap");
+    return "Skin" == wrap || "Cloth" == wrap;
+}
+
+bool MeshGenerator::wrapKeepsChildren(const std::map<std::string, std::string>* component)
+{
+    if (nullptr == component)
+        return false;
+    std::string keep = String::valueOrEmpty(*component, "wrapKeep");
+    if (!keep.empty())
+        return String::isTrue(keep);
+    // by default a creature skin replaces what it wraps, a garment is worn over it
+    return "Cloth" == String::valueOrEmpty(*component, "wrap");
+}
+
+void MeshGenerator::collectBindSamples(const std::string& componentIdString,
+    WrapMeshBuilder* builder,
+    int depth,
+    std::vector<Vector3>* surfaceVertices,
+    std::vector<std::vector<size_t>>* surfaceFaces)
+{
+    if (depth > 16)
+        return;
+    const auto* component = findComponent(componentIdString);
+    if (nullptr == component)
+        return;
+    auto addSamples = [&](const std::string& idString) {
+        std::unique_ptr<MeshState> mesh;
+        if (m_generatedComponentIds.find(idString) != m_generatedComponentIds.end()) {
+            const auto& cached = m_cacheContext->components[idString].mesh;
+            if (nullptr != cached)
+                mesh = std::make_unique<MeshState>(*cached);
+        } else {
+            CombineMode mode;
+            mesh = combineComponentMesh(idString, &mode);
+        }
+        if (nullptr == mesh || mesh->isNull())
+            return;
+        const auto& cache = m_cacheContext->components[idString];
+        std::vector<Vector3> vertices;
+        std::vector<std::vector<size_t>> faces;
+        mesh->fetch(vertices, faces);
+        for (const auto& vertex : vertices) {
+            auto findNode = cache.positionToNodeIdMap.find(PositionKey(vertex));
+            if (findNode != cache.positionToNodeIdMap.end())
+                builder->addBindSample(vertex, findNode->second);
+        }
+        if (nullptr != surfaceVertices && nullptr != surfaceFaces) {
+            size_t offset = surfaceVertices->size();
+            surfaceVertices->insert(surfaceVertices->end(), vertices.begin(), vertices.end());
+            for (auto face : faces) {
+                for (auto& index : face)
+                    index += offset;
+                surfaceFaces->push_back(face);
+            }
+        }
+    };
+    if ("partId" == String::valueOrEmpty(*component, "linkDataType")) {
+        auto findPart = m_snapshot->parts.find(String::valueOrEmpty(*component, "linkData"));
+        if (findPart == m_snapshot->parts.end())
+            return;
+        std::string target = String::valueOrEmpty(findPart->second, "target");
+        if (target.empty() || "Model" == target || "ImportedModel" == target)
+            addSamples(componentIdString);
+        return;
+    }
+    // the parts that make a group, wherever they are in it (a skin's own surface is made
+    // from them, so its weights are theirs)
+    for (const auto& childIdString : String::split(String::valueOrEmpty(*component, "children"), ',')) {
+        if (childIdString.empty())
+            continue;
+        const auto* child = findComponent(childIdString);
+        if (nullptr == child || CombineMode::Uncombined == componentCombineMode(child) || CombineMode::Inversion == componentCombineMode(child))
+            continue;
+        collectBindSamples(childIdString, builder, depth + 1, surfaceVertices, surfaceFaces);
+    }
+}
+
+void MeshGenerator::collectWrapSources(const std::string& componentIdString,
+    bool subtract,
+    WrapMeshBuilder* builder,
+    size_t* sourceCount)
+{
+    const auto* component = findComponent(componentIdString);
+    if (nullptr == component)
+        return;
+
+    auto partTarget = [&](const std::map<std::string, std::string>* child) -> std::string {
+        if ("partId" != String::valueOrEmpty(*child, "linkDataType"))
+            return std::string();
+        auto findPart = m_snapshot->parts.find(String::valueOrEmpty(*child, "linkData"));
+        if (findPart == m_snapshot->parts.end())
+            return std::string();
+        std::string target = String::valueOrEmpty(findPart->second, "target");
+        return target.empty() ? std::string("Model") : target;
+    };
+    auto hasStitchingChildren = [&](const std::map<std::string, std::string>* group) {
+        for (const auto& childIdString : String::split(String::valueOrEmpty(*group, "children"), ',')) {
+            const auto* child = findComponent(childIdString);
+            if (nullptr == child)
+                continue;
+            std::string target = partTarget(child);
+            if ("StitchingLine" == target || "StitchingLoop" == target)
+                return true;
+        }
+        return false;
+    };
+    auto addSource = [&](const MeshState* mesh, const GeneratedComponent& cache, bool carve) {
+        if (nullptr == mesh || mesh->isNull())
+            return;
+        std::vector<Vector3> vertices;
+        std::vector<std::vector<size_t>> faces;
+        mesh->fetch(vertices, faces);
+        if (faces.empty())
+            return;
+        builder->addSource(vertices, faces, carve);
+        ++(*sourceCount);
+        if (carve)
+            return;
+        for (const auto& vertex : vertices) {
+            PositionKey key(vertex);
+            auto findNode = cache.positionToNodeIdMap.find(key);
+            if (findNode != cache.positionToNodeIdMap.end()) {
+                builder->addBindSample(vertex, findNode->second);
+                continue;
+            }
+            auto findWeights = cache.positionToNodeWeights.find(key);
+            if (findWeights != cache.positionToNodeWeights.end() && !findWeights->second.empty())
+                builder->addBindSample(vertex, findWeights->second.front().first);
+        }
+    };
+
+    bool hasStitching = false;
+    for (const auto& childIdString : String::split(String::valueOrEmpty(*component, "children"), ',')) {
+        if (childIdString.empty())
+            continue;
+        const auto* child = findComponent(childIdString);
+        if (nullptr == child)
+            continue;
+        std::string target = partTarget(child);
+        if ("StitchingLine" == target || "StitchingLoop" == target) {
+            hasStitching = true;
+            continue;
+        }
+        CombineMode childCombineMode = componentCombineMode(child);
+        if (CombineMode::Uncombined == childCombineMode) {
+            // not wrapped: generated as usual, and collected as its own mesh
+            CombineMode mode;
+            combineComponentMesh(childIdString, &mode);
+            continue;
+        }
+        bool carve = subtract || CombineMode::Inversion == childCombineMode;
+        bool isLeaf = !target.empty() || isWrapComponent(child) || hasStitchingChildren(child);
+        if (!isLeaf) {
+            // a plain group: wrap its children directly, no boolean union needed
+            collectWrapSources(childIdString, carve, builder, sourceCount);
+            continue;
+        }
+        std::unique_ptr<MeshState> childMesh;
+        if (m_generatedComponentIds.find(childIdString) != m_generatedComponentIds.end()) {
+            const auto& cached = m_cacheContext->components[childIdString].mesh;
+            if (nullptr != cached)
+                childMesh = std::make_unique<MeshState>(*cached);
+        } else {
+            CombineMode mode;
+            childMesh = combineComponentMesh(childIdString, &mode);
+        }
+        const auto& childCache = m_cacheContext->components[childIdString];
+        addSource(childMesh.get(), childCache, carve);
+        // a garment inside a garment: the outer one goes over both (layering)
+        if (childCache.wrapOutput && childCache.wrapOutput->mesh)
+            addSource(childCache.wrapOutput->mesh.get(), *childCache.wrapOutput, carve);
+    }
+
+    if (hasStitching) {
+        // stitched shells (fins, collars, a loft over ribs) inside the wrap group
+        std::vector<std::string> stitchingParts, stitchingComponents, stitchingLoopParts, stitchingLoopComponents;
+        for (const auto& childIdString : String::split(String::valueOrEmpty(*component, "children"), ',')) {
+            const auto* child = findComponent(childIdString);
+            if (nullptr == child)
+                continue;
+            std::string target = partTarget(child);
+            if ("StitchingLine" == target) {
+                stitchingParts.push_back(String::valueOrEmpty(*child, "linkData"));
+                stitchingComponents.push_back(childIdString);
+            } else if ("StitchingLoop" == target) {
+                stitchingLoopParts.push_back(String::valueOrEmpty(*child, "linkData"));
+                stitchingLoopComponents.push_back(childIdString);
+            }
+        }
+        std::string colorString = String::valueOrEmpty(*component, "color");
+        Color color = colorString.empty() ? m_defaultPartColor : Color(colorString);
+        size_t targetSegments = (size_t)String::toInt(String::valueOrEmpty(*component, "targetSegments"));
+        if (targetSegments > 100)
+            targetSegments = 0;
+        if (!stitchingParts.empty()) {
+            GeneratedComponent stitchingCache;
+            auto stitchingMesh = combineStitchingMesh(componentIdString, stitchingParts, stitchingComponents,
+                String::isTrue(String::valueOrEmpty(*component, "frontClosed")),
+                String::isTrue(String::valueOrEmpty(*component, "backClosed")),
+                String::isTrue(String::valueOrEmpty(*component, "sideClosed")),
+                targetSegments, color, 0.0f, stitchingCache);
+            addSource(stitchingMesh.get(), stitchingCache, subtract);
+        }
+        if (!stitchingLoopParts.empty()) {
+            GeneratedComponent stitchingCache;
+            float backCloseDepthRatio = 1.0f;
+            float backCloseSharpness = 0.0f;
+            auto it = component->find("backCloseDepthRatio");
+            if (it != component->end())
+                backCloseDepthRatio = String::toFloat(it->second);
+            it = component->find("backCloseSharpness");
+            if (it != component->end())
+                backCloseSharpness = String::toFloat(it->second);
+            auto stitchingLoopMesh = combineStitchingLoopMesh(componentIdString, stitchingLoopParts, stitchingLoopComponents,
+                String::isTrue(String::valueOrEmpty(*component, "backClosed")),
+                backCloseDepthRatio, backCloseSharpness, targetSegments, color, 0.0f, stitchingCache);
+            addSource(stitchingLoopMesh.get(), stitchingCache, subtract);
+        }
+    }
+}
+
+std::unique_ptr<MeshState> MeshGenerator::buildWrapMesh(const std::string& componentIdString,
+    const std::map<std::string, std::string>& component,
+    const Color& color,
+    float smoothCutoffDegrees,
+    GeneratedComponent& output)
+{
+    bool cloth = "Cloth" == String::valueOrEmpty(component, "wrap");
+    auto readFloat = [&](const char* name, double defaultValue) {
+        auto it = component.find(name);
+        if (it == component.end() || it->second.empty())
+            return defaultValue;
+        return (double)String::toFloat(it->second);
+    };
+
+    WrapMeshBuilder::Parameters parameters;
+    parameters.mode = cloth ? WrapMeshBuilder::Mode::Cloth : WrapMeshBuilder::Mode::Skin;
+    parameters.offset = readFloat("wrapOffset", cloth ? 0.012 : 0.0);
+    parameters.smoothness = std::max(0.0, readFloat("wrapSmoothness", cloth ? 0.05 : 0.02));
+    parameters.drape = std::max(0.0, std::min(1.0, readFloat("wrapDrape", cloth ? 0.5 : 0.0)));
+    parameters.drapeLength = std::max(0.0, readFloat("wrapDrapeLength", 0.0));
+    parameters.openTop = std::max(0.0, std::min(0.45, readFloat("wrapOpenTop", 0.0)));
+    parameters.openBottom = std::max(0.0, std::min(0.45, readFloat("wrapOpenBottom", 0.0)));
+    parameters.thickness = std::max(0.0, readFloat("wrapThickness", cloth ? 0.004 : 0.0));
+    parameters.targetFaces = (size_t)std::max(64.0, std::min(40000.0, readFloat("wrapFaces", cloth ? 1200.0 : 1600.0)));
+    parameters.weightRadius = std::max(0.0, readFloat("wrapWeightRadius", 0.0));
+    // the group's "Normal Smooth" cutoff is AutoRemesher's "Smooth Normal" (0 = off)
+    parameters.smoothNormalDegrees = std::max(0.0, std::min(180.0, (double)smoothCutoffDegrees));
+    parameters.label = String::valueOrEmpty(component, "name");
+
+    WrapMeshBuilder builder;
+    builder.setParameters(parameters);
+    builder.setCache(&m_cacheContext->wrapCache);
+    size_t sourceCount = 0;
+    collectWrapSources(componentIdString, false, &builder, &sourceCount);
+    if (0 == sourceCount)
+        return nullptr;
+
+    // A garment can take its skin weights from the body it is worn over (another group,
+    // usually the creature skin): then the body and the garment bend alike everywhere,
+    // whatever shapes the garment was made from.
+    // The body is also what the cloth rests on, where it is not free to fold (see
+    // ClothFolds): its surface is kept for placing the folds.
+    std::string bindTo = String::valueOrEmpty(component, "wrapBindTo");
+    std::vector<Vector3> bodyVertices;
+    std::vector<std::vector<size_t>> bodyFaces;
+    if (!bindTo.empty() && bindTo != componentIdString && nullptr != findComponent(bindTo)) {
+        WrapMeshBuilder probe;
+        collectBindSamples(bindTo, &probe, 0, &bodyVertices, &bodyFaces);
+        if (probe.bindSampleCount() > 0) {
+            builder.clearBindSamples();
+            collectBindSamples(bindTo, &builder);
+        }
+        // the body's own wrap (a creature skin) is its visible surface
+        const auto& bodyCache = m_cacheContext->components[bindTo];
+        if (bodyCache.wrapOutput && bodyCache.wrapOutput->mesh && !bodyCache.wrapOutput->mesh->isNull()) {
+            bodyVertices.clear();
+            bodyFaces.clear();
+            bodyCache.wrapOutput->mesh->fetch(bodyVertices, bodyFaces);
+        }
+    }
+    // the node spheres and part edges behind the weights (see WrapMeshBuilder::BindNode),
+    // also the skeleton the folds are placed from
+    std::vector<WrapMeshBuilder::BindNode> skeletonNodes;
+    std::vector<std::pair<Uuid, Uuid>> skeletonLinks;
+    {
+        std::set<std::string> nodeIdStrings;
+        for (const auto& nodeId : builder.bindNodeIds()) {
+            std::string nodeIdString = nodeId.toString();
+            auto findNode = m_snapshot->nodes.find(nodeIdString);
+            if (findNode == m_snapshot->nodes.end())
+                continue;
+            const auto& node = findNode->second;
+            std::string partIdString = String::valueOrEmpty(node, "partId");
+            auto findPart = m_snapshot->parts.find(partIdString);
+            if (findPart == m_snapshot->parts.end())
+                continue;
+            std::string mirrorFrom = String::valueOrEmpty(findPart->second, "__mirrorFromPartId");
+            double x = String::toFloat(String::valueOrEmpty(node, "x")) - m_mainProfileMiddleX;
+            if (!String::valueOrEmpty(node, "__mirrorFromNodeId").empty())
+                x = -x;
+            WrapMeshBuilder::BindNode bindNode;
+            bindNode.id = nodeId;
+            bindNode.position = Vector3(x,
+                m_mainProfileMiddleY - String::toFloat(String::valueOrEmpty(node, "y")),
+                m_sideProfileMiddleX - String::toFloat(String::valueOrEmpty(node, "z")));
+            bindNode.radius = String::toFloat(String::valueOrEmpty(node, "radius"));
+            bindNode.group = partIdString;
+            bindNode.twinGroup = mirrorFrom.empty() ? partIdString : mirrorFrom;
+            builder.addBindNode(bindNode);
+            skeletonNodes.push_back(bindNode);
+            nodeIdStrings.insert(nodeIdString);
+        }
+        for (const auto& edgeIt : m_snapshot->edges) {
+            std::string from = String::valueOrEmpty(edgeIt.second, "from");
+            std::string to = String::valueOrEmpty(edgeIt.second, "to");
+            if (nodeIdStrings.count(from) && nodeIdStrings.count(to)) {
+                builder.addBindLink(Uuid(from), Uuid(to));
+                skeletonLinks.push_back({ Uuid(from), Uuid(to) });
+            }
+        }
+    }
+    if (!builder.build()) {
+        dust3dDebug << "Wrap of component" << componentIdString.c_str() << "failed:" << builder.errorMessage().c_str();
+        m_isSuccessful = false;
+        return nullptr;
+    }
+
+    const auto& vertices = builder.resultVertices();
+    const auto& triangles = builder.resultTriangles();
+    const auto& triangleUvs = builder.resultTriangleUvs();
+    const auto& nodeWeights = builder.resultVertexNodeWeights();
+
+    // Folds and wrinkles: placed where and the way the cloth folds (from where it rests on
+    // the body and where it stands free, the body's skeleton and the openings), baked into
+    // the normal map by the texture generator.
+    {
+        std::string foldText;
+        if (readFloat("wrapWrinkles", 0.0) > 0.0) {
+            ClothFolds::PlacementInput input;
+            input.vertices = vertices;
+            input.triangles = triangles;
+            std::map<Uuid, size_t> nodeIndices;
+            for (const auto& node : skeletonNodes) {
+                nodeIndices[node.id] = input.nodes.size();
+                input.nodes.push_back({ node.position, node.radius, node.group });
+            }
+            for (const auto& link : skeletonLinks) {
+                auto first = nodeIndices.find(link.first), second = nodeIndices.find(link.second);
+                if (first != nodeIndices.end() && second != nodeIndices.end())
+                    input.links.push_back({ first->second, second->second });
+            }
+            input.bodyVertices = bodyVertices;
+            input.bodyTriangles = bodyFaces;
+            input.cloth = cloth;
+            input.drape = parameters.drape;
+            input.sizeScale = std::max(0.2, std::min(4.0, readFloat("wrapWrinkleSize", 1.0)));
+            input.seed = SurfacePattern::seedFromString(componentIdString);
+            foldText = ClothFolds::serialize(ClothFolds::place(input));
+        }
+        if (componentIdString != to_string(Uuid()))
+            m_snapshot->components[componentIdString]["__wrapFolds"] = foldText;
+        m_cacheContext->components[componentIdString].wrapFolds = foldText;
+    }
+
+    // A wrap without a colour of its own takes the colour of most of what it wraps.
+    Color wrapColor = color;
+    if (String::valueOrEmpty(component, "color").empty()) {
+        std::map<std::string, size_t> colorVotes;
+        std::map<std::string, Color> colorByName;
+        for (size_t v = 0; v < vertices.size(); ++v) {
+            if (nodeWeights[v].empty())
+                continue;
+            for (const auto& cacheIt : m_cacheContext->components) {
+                auto findNode = cacheIt.second.nodeMap.find(nodeWeights[v].front().nodeId);
+                if (findNode == cacheIt.second.nodeMap.end())
+                    continue;
+                std::string name = findNode->second.color.toString();
+                colorVotes[name]++;
+                colorByName[name] = findNode->second.color;
+                break;
+            }
+        }
+        size_t best = 0;
+        for (const auto& it : colorVotes) {
+            if (it.second > best) {
+                best = it.second;
+                wrapColor = colorByName[it.first];
+            }
+        }
+        if (best > 0 && componentIdString != to_string(Uuid())) {
+            m_snapshot->components[componentIdString]["color"] = wrapColor.toString();
+            m_cacheContext->components[componentIdString].wrapColor = wrapColor.toString();
+        }
+    }
+
+    float cutoff = smoothCutoffDegrees > 0.0f ? smoothCutoffDegrees : (cloth ? 60.0f : 89.0f);
+    Uuid componentId(componentIdString);
+    auto& uvs = output.componentTriangleUvs[componentId];
+    for (size_t t = 0; t < triangles.size(); ++t) {
+        const auto& triangle = triangles[t];
+        uvs.insert({ { PositionKey(vertices[triangle[0]]), PositionKey(vertices[triangle[1]]), PositionKey(vertices[triangle[2]]) },
+            triangleUvs[t] });
+    }
+    for (const auto& diagonal : builder.resultQuadDiagonals())
+        output.sharedQuadEdges.insert({ PositionKey(vertices[diagonal.first]), PositionKey(vertices[diagonal.second]) });
+    for (size_t v = 0; v < vertices.size(); ++v) {
+        PositionKey key(vertices[v]);
+        std::vector<std::pair<Uuid, float>> weights;
+        for (const auto& w : nodeWeights[v])
+            weights.push_back({ w.nodeId, w.weight });
+        output.positionToNodeWeights[key] = weights;
+        output.positionToVertexAttribute[key] = ObjectVertexAttribute { wrapColor, cutoff };
+    }
+    dust3dDebug << "Wrap of component" << componentIdString.c_str() << ":" << (cloth ? "cloth" : "skin")
+                << sourceCount << "sources," << vertices.size() << "vertices," << triangles.size() << "triangles, cell" << builder.cellSize();
+    return std::make_unique<MeshState>(vertices, triangles);
 }
 
 void MeshGenerator::collectBrokenTriangles(const std::string& componentIdString)
@@ -1569,6 +2210,11 @@ void MeshGenerator::interpolateEdgesAroundJoints()
             continue;
         auto target = PartTargetFromString(String::valueOrEmpty(findPart->second, "target").c_str());
         if (PartTarget::Model != target && PartTarget::ImportedModel != target)
+            continue;
+        // "interpolated" = "false": rings only at the part's own nodes, no end rings either
+        // (rigid, low-poly and hard-surface parts)
+        std::string interpolatedString = String::valueOrEmpty(findPart->second, "interpolated");
+        if (!interpolatedString.empty() && !String::isTrue(interpolatedString))
             continue;
         std::vector<std::string> edgesToInterpolate;
         for (const auto& edgeIdString : partEntry.second) {
@@ -1660,18 +2306,29 @@ void MeshGenerator::interpolateEdgesAroundJoints()
 
             std::map<std::string, std::string> node1;
             node1["id"] = newNodeId1;
-            node1["x"] = std::to_string(a1x);
-            node1["y"] = std::to_string(a1y);
-            node1["z"] = std::to_string(a1z);
-            node1["radius"] = std::to_string(a1Radius);
+            node1["x"] = String::fromDouble(a1x);
+            node1["y"] = String::fromDouble(a1y);
+            node1["z"] = String::fromDouble(a1z);
+            node1["radius"] = String::fromDouble(a1Radius);
             node1["partId"] = partIdString;
             std::map<std::string, std::string> node2;
             node2["id"] = newNodeId2;
-            node2["x"] = std::to_string(a2x);
-            node2["y"] = std::to_string(a2y);
-            node2["z"] = std::to_string(a2z);
-            node2["radius"] = std::to_string(a2Radius);
+            node2["x"] = String::fromDouble(a2x);
+            node2["y"] = String::fromDouble(a2y);
+            node2["z"] = String::fromDouble(a2z);
+            node2["radius"] = String::fromDouble(a2Radius);
             node2["partId"] = partIdString;
+            // carry a per-node cross-section scale along the edge like the radius
+            for (const char* key : { "deformWidth", "deformThickness" }) {
+                std::string fromString = String::valueOrEmpty(fromNode, key);
+                std::string toString = String::valueOrEmpty(toNode, key);
+                if (fromString.empty() && toString.empty())
+                    continue;
+                float fromValue = fromString.empty() ? 1.0f : String::toFloat(fromString);
+                float toValue = toString.empty() ? 1.0f : String::toFloat(toString);
+                node1[key] = String::fromDouble(fromValue * (1.0f - t1) + toValue * t1);
+                node2[key] = String::fromDouble(toValue * (1.0f - t2) + fromValue * t2);
+            }
             m_snapshot->nodes[newNodeId1] = node1;
             m_snapshot->nodes[newNodeId2] = node2;
             auto createEdge = [&](const std::string& id, const std::string& from, const std::string& to) {
@@ -1819,6 +2476,26 @@ void MeshGenerator::preprocessMirror()
         parentMap[childId] = std::string();
     }
 
+    // Components are keyed by id, and ids are regenerated randomly whenever a document
+    // is loaded, so iterating the map directly would union mirrored parts in a random
+    // order (making the output mesh differ from run to run). Order them by where their
+    // source component appears in the component tree instead.
+    std::map<std::string, size_t> componentTreeOrder;
+    {
+        std::function<void(const std::string&)> visitChildren;
+        visitChildren = [&](const std::string& childrenString) {
+            for (const auto& childId : String::split(childrenString, ',')) {
+                if (childId.empty() || componentTreeOrder.count(childId))
+                    continue;
+                componentTreeOrder.insert({ childId, componentTreeOrder.size() });
+                auto findChild = m_snapshot->components.find(childId);
+                if (findChild != m_snapshot->components.end())
+                    visitChildren(String::valueOrEmpty(findChild->second, "children"));
+            }
+        };
+        visitChildren(String::valueOrEmpty(m_snapshot->rootComponent, "children"));
+    }
+    std::vector<std::pair<size_t, std::map<std::string, std::string>>> orderedNewComponents;
     std::vector<std::map<std::string, std::string>> newComponents;
     for (auto& componentIt : m_snapshot->components) {
         std::string linkDataType = String::valueOrEmpty(componentIt.second, "linkDataType");
@@ -1834,8 +2511,14 @@ void MeshGenerator::preprocessMirror()
         mirroredComponent["id"] = newComponentIdString;
         mirroredComponent["__dirty"] = "true";
         parentMap[newComponentIdString] = parentMap[String::valueOrEmpty(componentIt.second, "id")];
-        newComponents.push_back(mirroredComponent);
+        auto findOrder = componentTreeOrder.find(componentIt.first);
+        orderedNewComponents.emplace_back(findOrder == componentTreeOrder.end() ? std::numeric_limits<size_t>::max() : findOrder->second,
+            std::move(mirroredComponent));
     }
+    std::stable_sort(orderedNewComponents.begin(), orderedNewComponents.end(),
+        [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (auto& it : orderedNewComponents)
+        newComponents.push_back(std::move(it.second));
 
     for (const auto& it : newParts) {
         m_snapshot->parts[String::valueOrEmpty(it, "id")] = it;
@@ -1852,6 +2535,108 @@ void MeshGenerator::preprocessMirror()
     }
 }
 
+// Preview the complete visible output of a group, including meshes which bypass
+// boolean combination. Resolve properties before the application normalizes positions.
+void MeshGenerator::collectComponentPreview(const std::string& componentIdString,
+    bool includeMesh, ComponentPreview& preview)
+{
+    const auto* component = findComponent(componentIdString);
+    auto findCache = m_cacheContext->components.find(componentIdString);
+    if (nullptr == component || findCache == m_cacheContext->components.end())
+        return;
+    const auto& cache = findCache->second;
+    auto appendMesh = [&](const MeshState* mesh, const GeneratedComponent& source) {
+        if (nullptr == mesh || mesh->isNull())
+            return;
+        std::vector<Vector3> vertices;
+        std::vector<std::vector<size_t>> triangles;
+        mesh->fetch(vertices, triangles);
+        size_t offset = preview.vertices.size();
+        for (auto triangle : triangles) {
+            for (auto& index : triangle)
+                index += offset;
+            preview.triangles.push_back(std::move(triangle));
+        }
+        for (const auto& vertex : vertices) {
+            Color vertexColor = preview.color;
+            float metalness = 0.0f;
+            float roughness = 1.0f;
+            auto findNodeId = source.positionToNodeIdMap.find(vertex);
+            if (findNodeId != source.positionToNodeIdMap.end()) {
+                auto findNode = source.nodeMap.find(findNodeId->second);
+                if (findNode != source.nodeMap.end())
+                    vertexColor = findNode->second.color;
+                auto snapshotNode = m_snapshot->nodes.find(findNodeId->second.toString());
+                if (snapshotNode != m_snapshot->nodes.end()) {
+                    auto part = m_cacheContext->parts.find(String::valueOrEmpty(snapshotNode->second, "partId"));
+                    if (part != m_cacheContext->parts.end()) {
+                        metalness = part->second.metalness;
+                        roughness = part->second.roughness;
+                    }
+                }
+            } else {
+                auto attribute = source.positionToVertexAttribute.find(vertex);
+                if (attribute != source.positionToVertexAttribute.end())
+                    vertexColor = attribute->second.color;
+            }
+            auto importedColor = source.importedVertexColorMap.find(vertex);
+            if (importedColor != source.importedVertexColorMap.end())
+                vertexColor = importedColor->second;
+            preview.vertexProperties.emplace_back(vertexColor, metalness, roughness);
+        }
+        preview.vertices.insert(preview.vertices.end(), vertices.begin(), vertices.end());
+        for (const auto& componentUvs : source.componentTriangleUvs)
+            preview.triangleUvs.insert(componentUvs.second.begin(), componentUvs.second.end());
+    };
+    if (includeMesh)
+        appendMesh(cache.mesh.get(), cache);
+    if (cache.wrapOutput)
+        appendMesh(cache.wrapOutput->mesh.get(), *cache.wrapOutput);
+    for (const auto& childId : String::split(String::valueOrEmpty(*component, "children"), ',')) {
+        const auto* child = findComponent(childId);
+        if (nullptr == child)
+            continue;
+        collectComponentPreview(childId, CombineMode::Uncombined == componentCombineMode(child), preview);
+    }
+}
+
+void MeshGenerator::generateDisabledComponentPreviews()
+{
+    bool hasDisabledParts = false;
+    for (const auto& part : m_snapshot->parts)
+        hasDisabledParts |= String::isTrue(String::valueOrEmpty(part.second, "disabled"));
+    if (!hasDisabledParts)
+        return;
+
+    // Disabled parts still have leaf thumbnails. Give their empty parent groups
+    // thumbnails as well, without enabling them in the document or render cache.
+    auto* previewSnapshot = new Snapshot(*m_snapshot);
+    for (auto& part : previewSnapshot->parts)
+        part.second["disabled"] = "false";
+    GeneratedCacheContext previewCache;
+    MeshGenerator previewGenerator(previewSnapshot);
+    previewGenerator.m_cacheContext = &previewCache;
+    previewGenerator.m_defaultPartColor = m_defaultPartColor;
+    previewGenerator.m_mainProfileMiddleX = m_mainProfileMiddleX;
+    previewGenerator.m_mainProfileMiddleY = m_mainProfileMiddleY;
+    previewGenerator.m_sideProfileMiddleX = m_sideProfileMiddleX;
+    previewGenerator.m_importedModelData = m_importedModelData;
+    // The snapshot already has interpolated and mirrored nodes.
+    previewGenerator.collectParts();
+    for (auto& entry : m_generatedComponentPreviews) {
+        if (!entry.second.triangles.empty() || !entry.second.cutFaceTemplate.empty())
+            continue;
+        const auto* component = findComponent(entry.first.toString());
+        if (nullptr == component || "partId" == String::valueOrEmpty(*component, "linkDataType"))
+            continue;
+        CombineMode mode;
+        previewGenerator.combineComponentMesh(entry.first.toString(), &mode);
+        auto generated = previewGenerator.m_generatedComponentPreviews.find(entry.first);
+        if (generated != previewGenerator.m_generatedComponentPreviews.end() && !generated->second.triangles.empty())
+            entry.second = generated->second;
+    }
+}
+
 void MeshGenerator::addComponentPreview(const Uuid& componentId, ComponentPreview&& preview)
 {
     m_generatedPreviewComponentIds.insert(componentId);
@@ -1864,6 +2649,15 @@ void MeshGenerator::generate()
         return;
 
     m_isSuccessful = true;
+
+    if (seamReportEnabled()) {
+        // Tells tools this build reports seams, even for a model with nothing to combine.
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            std::cout << "SEAM_REPORT_SUPPORTED 1" << std::endl;
+        }
+    }
 
     m_mainProfileMiddleX = String::toFloat(String::valueOrEmpty(m_snapshot->canvas, "originX"));
     m_mainProfileMiddleY = String::toFloat(String::valueOrEmpty(m_snapshot->canvas, "originY"));
@@ -1926,6 +2720,7 @@ void MeshGenerator::generate()
     }
 
     m_dirtyComponentIds.insert(to_string(Uuid()));
+    m_generatedComponentIds.clear();
 
     CombineMode combineMode;
     auto combinedMesh = combineComponentMesh(to_string(Uuid()), &combineMode);
@@ -1934,6 +2729,8 @@ void MeshGenerator::generate()
 
     m_object->positionToNodeIdMap = componentCache.positionToNodeIdMap;
     m_object->nodeMap = componentCache.nodeMap;
+    m_object->positionToNodeWeights = componentCache.positionToNodeWeights;
+    m_object->positionToVertexAttribute = componentCache.positionToVertexAttribute;
     m_object->componentTriangleUvs = componentCache.componentTriangleUvs;
 
     std::vector<Vector3> combinedVertices;
@@ -1985,6 +2782,8 @@ void MeshGenerator::generate()
             m_object->setTriangleVertexNormals(newTriNormals);
         }
     }
+
+    generateDisabledComponentPreviews();
 
     if (needDeleteCacheContext) {
         delete m_cacheContext;

@@ -31,6 +31,7 @@
 #include <dust3d/base/vector3.h>
 #include <dust3d/rig/rig_generator.h>
 #include <limits>
+#include <set>
 
 namespace dust3d {
 
@@ -75,6 +76,39 @@ static bool edgeBelongsToModelPart(const Snapshot* snapshot,
     Uuid toId(toNode);
     return nodeBelongsToModelPart(snapshot, fromId)
         && nodeBelongsToModelPart(snapshot, toId);
+}
+
+// Parts that are not unioned into the body: the children of an Uncombined component (or of
+// a group under one). These are held props, clothes, hair and decorations.
+static std::set<std::string> collectDetachedParts(const Snapshot* snapshot)
+{
+    std::set<std::string> detached;
+    if (!snapshot)
+        return detached;
+    std::vector<std::pair<std::string, bool>> stack;
+    for (const auto& id : String::split(String::valueOrEmpty(snapshot->rootComponent, "children"), ','))
+        if (!id.empty())
+            stack.push_back({ id, false });
+    std::set<std::string> visited;
+    while (!stack.empty()) {
+        auto [id, inherited] = stack.back();
+        stack.pop_back();
+        if (!visited.insert(id).second)
+            continue;
+        auto it = snapshot->components.find(id);
+        if (it == snapshot->components.end())
+            continue;
+        bool isDetached = inherited || "Uncombined" == String::valueOrEmpty(it->second, "combineMode");
+        if ("partId" == String::valueOrEmpty(it->second, "linkDataType")) {
+            if (isDetached)
+                detached.insert(String::valueOrEmpty(it->second, "linkData"));
+            continue;
+        }
+        for (const auto& child : String::split(String::valueOrEmpty(it->second, "children"), ','))
+            if (!child.empty())
+                stack.push_back({ child, isDetached });
+    }
+    return detached;
 }
 
 static bool boneUsesParentEndAsReference(const std::string& boneName)
@@ -156,6 +190,16 @@ bool RigGenerator::generateRig(const Snapshot* snapshot, const RigStructure& tem
     // Clear single node bone map before processing bones
     m_singleNodeBoneMap.clear();
 
+    // A bone's extent comes from the body parts it is assigned to. A spear, a club or a cape
+    // edge assigned to the hand or the chest only rides on that bone: when the bone also has
+    // body parts, those detached parts are left out, or the hand bone would run down the whole
+    // spear and every animation that aims the hand would aim the spear's far end instead.
+    std::set<std::string> detachedParts = collectDetachedParts(snapshot);
+    auto chainIsDetached = [&](const std::vector<Uuid>& chain) {
+        auto nodeIt = snapshot->nodes.find(chain.front().toString());
+        return nodeIt != snapshot->nodes.end() && detachedParts.count(String::valueOrEmpty(nodeIt->second, "partId")) > 0;
+    };
+
     // Process bones in topological order (parents before children)
     std::vector<size_t> processingOrder;
     std::set<std::string> processed;
@@ -196,6 +240,19 @@ bool RigGenerator::generateRig(const Snapshot* snapshot, const RigStructure& tem
                 bone.endY = -0.25f;
             }
             continue;
+        }
+
+        {
+            std::vector<std::vector<Uuid>> bodyChains;
+            for (const auto& chain : nodeChains) {
+                if (!chain.empty() && !chainIsDetached(chain))
+                    bodyChains.push_back(chain);
+            }
+            if (!bodyChains.empty() && bodyChains.size() < nodeChains.size()) {
+                dust3dDebug << "Bone" << bone.name.c_str() << ": placed by" << bodyChains.size() << "body chains,"
+                            << (nodeChains.size() - bodyChains.size()) << "detached chains ride on it";
+                nodeChains = bodyChains;
+            }
         }
 
         // Attach truly isolated nodes (no edges at all) to this bone
@@ -830,9 +887,11 @@ bool RigGenerator::generateRig(const Snapshot* snapshot, const RigStructure& tem
             continue;
         }
 
-        // Determine capsule radius from node radius average on the bone's node chains.
+        // Determine capsule radius from the largest node radius on the bone's node chains: a
+        // collision capsule must contain the part, and an average under-sizes bodies that are
+        // thick in the middle and thin at the ends.
         std::vector<std::vector<Uuid>> nodeChains;
-        float radiusSum = 0.0f;
+        float radiusMax = 0.0f;
         size_t radiusCount = 0;
         if (extractNodeChainsForBone(snapshot, bone.name, nodeChains)) {
             for (const auto& chain : nodeChains) {
@@ -843,7 +902,7 @@ bool RigGenerator::generateRig(const Snapshot* snapshot, const RigStructure& tem
                         if (it != snapshot->nodes.end()) {
                             float nodeRadius = String::toFloat(String::valueOrEmpty(it->second, "radius"));
                             if (nodeRadius > 1e-6f) {
-                                radiusSum += nodeRadius;
+                                radiusMax = std::max(radiusMax, nodeRadius);
                                 ++radiusCount;
                             }
                         }
@@ -854,7 +913,7 @@ bool RigGenerator::generateRig(const Snapshot* snapshot, const RigStructure& tem
 
         float radius = 0.0f;
         if (radiusCount > 0)
-            radius = radiusSum / static_cast<float>(radiusCount);
+            radius = radiusMax;
         else
             radius = std::max(0.01f, length * 0.12f);
 
@@ -1161,6 +1220,8 @@ bool RigGenerator::computeVertexBoneBindings(Object* object,
     // Initialize vertex bone arrays parallel to vertices
     object->vertexBone1.resize(object->vertices.size());
     object->vertexBone2.resize(object->vertices.size());
+    object->vertexBone3.assign(object->vertices.size(), { std::string(), 0.0f });
+    object->vertexBone4.assign(object->vertices.size(), { std::string(), 0.0f });
 
     // For each vertex, trace back to its source node and apply bone influence
     for (size_t i = 0; i < object->vertices.size(); ++i) {
@@ -1170,7 +1231,37 @@ bool RigGenerator::computeVertexBoneBindings(Object* object,
         // Find source node for this vertex
         auto it = object->positionToNodeIdMap.find(posKey);
         if (it == object->positionToNodeIdMap.end()) {
-            // Vertex has no source node mapping
+            // A wrap surface vertex: weights over several nodes, turned into up to four bones
+            auto findWeights = object->positionToNodeWeights.find(posKey);
+            if (findWeights == object->positionToNodeWeights.end() || findWeights->second.empty())
+                continue;
+            std::map<std::string, float> boneWeights;
+            for (const auto& nodeWeight : findWeights->second) {
+                auto boneIt = nodeBoneInfluences.find(nodeWeight.first);
+                if (boneIt == nodeBoneInfluences.end())
+                    continue;
+                VertexBoneBinding binding = boneIt->second.toVertexBinding();
+                if (!binding.bone1.empty())
+                    boneWeights[binding.bone1] += nodeWeight.second * binding.weight1;
+                if (!binding.bone2.empty())
+                    boneWeights[binding.bone2] += nodeWeight.second * binding.weight2;
+            }
+            std::vector<std::pair<std::string, float>> sorted(boneWeights.begin(), boneWeights.end());
+            std::sort(sorted.begin(), sorted.end(), [](const std::pair<std::string, float>& a, const std::pair<std::string, float>& b) {
+                if (a.second != b.second)
+                    return a.second > b.second;
+                return a.first < b.first;
+            });
+            if (sorted.size() > 4)
+                sorted.resize(4);
+            float sum = 0.0f;
+            for (const auto& b : sorted)
+                sum += b.second;
+            if (sum <= 0.0f)
+                continue;
+            std::vector<std::pair<std::string, float>>* boneSlots[4] = { &object->vertexBone1, &object->vertexBone2, &object->vertexBone3, &object->vertexBone4 };
+            for (size_t s = 0; s < 4; ++s)
+                (*boneSlots[s])[i] = s < sorted.size() ? std::make_pair(sorted[s].first, sorted[s].second / sum) : std::make_pair(std::string(), 0.0f);
             continue;
         }
 
@@ -1189,6 +1280,38 @@ bool RigGenerator::computeVertexBoneBindings(Object* object,
         // Store binding in parallel arrays
         object->vertexBone1[i] = { binding.bone1, binding.weight1 };
         object->vertexBone2[i] = { binding.bone2, binding.weight2 };
+    }
+
+    // Vertices created by mesh boolean operations (along the seams where parts are
+    // unioned) are not present in positionToNodeIdMap, and which ones are affected
+    // depends on the union order. Left unbound they have zero skin weight and collapse
+    // towards the origin when animated, so bind them like their nearest bound vertex.
+    std::vector<size_t> boundIndices;
+    std::vector<size_t> unboundIndices;
+    for (size_t i = 0; i < object->vertices.size(); ++i) {
+        if (object->vertexBone1[i].first.empty())
+            unboundIndices.push_back(i);
+        else
+            boundIndices.push_back(i);
+    }
+    if (!unboundIndices.empty() && !boundIndices.empty()) {
+        for (size_t i : unboundIndices) {
+            const Vector3& position = object->vertices[i];
+            double bestDistance2 = std::numeric_limits<double>::max();
+            size_t bestIndex = boundIndices[0];
+            for (size_t j : boundIndices) {
+                double distance2 = (object->vertices[j] - position).lengthSquared();
+                if (distance2 < bestDistance2) {
+                    bestDistance2 = distance2;
+                    bestIndex = j;
+                }
+            }
+            object->vertexBone1[i] = object->vertexBone1[bestIndex];
+            object->vertexBone2[i] = object->vertexBone2[bestIndex];
+            object->vertexBone3[i] = object->vertexBone3[bestIndex];
+            object->vertexBone4[i] = object->vertexBone4[bestIndex];
+        }
+        dust3dDebug << "Bound" << unboundIndices.size() << "vertices without source node to nearest bound vertex";
     }
 
     m_errorMessage = "";
@@ -1897,10 +2020,18 @@ bool RigGenerator::generateEyelidBones(Object* object, const Snapshot* snapshot,
             if (upperSet.count(pid)) {
                 object->vertexBone1[vi] = { upperName, 1.0f };
                 object->vertexBone2[vi] = { "", 0.0f };
+                if (vi < object->vertexBone3.size())
+                    object->vertexBone3[vi] = { "", 0.0f };
+                if (vi < object->vertexBone4.size())
+                    object->vertexBone4[vi] = { "", 0.0f };
                 ++upperCount;
             } else if (lowerSet.count(pid)) {
                 object->vertexBone1[vi] = { lowerName, 1.0f };
                 object->vertexBone2[vi] = { "", 0.0f };
+                if (vi < object->vertexBone3.size())
+                    object->vertexBone3[vi] = { "", 0.0f };
+                if (vi < object->vertexBone4.size())
+                    object->vertexBone4[vi] = { "", 0.0f };
                 ++lowerCount;
             }
         }

@@ -255,27 +255,11 @@ namespace biped {
                         hasPrev = true;
                     }
                 }
+                // Legs stay planted (lifted by `lift` for a stomp): two-bone IK to the rest ankle, the knee
+                // keeps its rest bend and the foot stays flat, so the legs are exactly at rest when the
+                // body is.
                 auto computeLeg = [&](const char* ul, const char* ll, const char* f, double lift) {
-                    Vector3 footStart = bonePos(f) + upDir * lift;
-                    Vector3 footVec = boneEnd(f) - bonePos(f); // rest-pose foot direction+length
-                    Vector3 hipJoint = bodyTransform.transformPoint(bonePos(ul));
-                    double upperLen = (boneEnd(ul) - bonePos(ul)).length();
-                    double lowerLen = (boneEnd(ll) - bonePos(ll)).length();
-                    Vector3 midBind = bodyTransform.transformPoint(bonePos(ll));
-                    Vector3 poleTarget = midBind + forward * (upperLen * 0.5);
-                    // Init joints with rest-pose lengths so IK never stretches bones
-                    Vector3 hipToKnee = midBind - hipJoint;
-                    double hkLen = hipToKnee.length();
-                    Vector3 kneeInit = (hkLen > 1e-6) ? hipJoint + hipToKnee * (upperLen / hkLen) : hipJoint + upDir * (-upperLen);
-                    Vector3 kneeToFoot = footStart - kneeInit;
-                    double kfLen = kneeToFoot.length();
-                    Vector3 ankleInit = (kfLen > 1e-6) ? kneeInit + kneeToFoot * (lowerLen / kfLen) : kneeInit + upDir * (-lowerLen);
-                    std::vector<Vector3> joints = { hipJoint, kneeInit, ankleInit };
-                    solveTwoBoneIk(joints, footStart, poleTarget, 0.05);
-                    boneWorldTransforms[ul] = buildBoneWorldTransform(joints[0], joints[1]);
-                    boneWorldTransforms[ll] = buildBoneWorldTransform(joints[1], joints[2]);
-                    // Foot starts at IK-solved ankle so there is no gap with the lower leg
-                    boneWorldTransforms[f] = buildBoneWorldTransform(joints[2], joints[2] + footVec);
+                    posePlantedLeg(rigStructure, boneIdx, ul, ll, f, bodyTransform, upDir * lift, boneWorldTransforms);
                 };
                 computeLeg("LeftUpperLeg", "LeftLowerLeg", "LeftFoot", 0.0);
                 computeLeg("RightUpperLeg", "RightLowerLeg", "RightFoot", 0.0);
@@ -283,7 +267,6 @@ namespace biped {
                 // ARMS: extended forward with loopable micro-fluctuations
                 for (int side = 0; side < 2; ++side) {
                     bool isLeft = (side == 0);
-                    double sideSign = isLeft ? -1.0 : 1.0;
                     double phaseOff = isLeft ? Math::Pi : 0.0; // arms slightly out of phase
                     const char* shoulder = isLeft ? "LeftShoulder" : "RightShoulder";
                     const char* upper = isLeft ? "LeftUpperArm" : "RightUpperArm";
@@ -293,7 +276,7 @@ namespace biped {
                     // Shoulder start: chest's FK-propagated end so the arm chain
                     // is physically connected to the spine (no gap under spine rotation).
                     Vector3 shPos = boneChainEnd.count("Chest") > 0
-                        ? boneChainEnd["Chest"]
+                        ? carryWithBone(buildBoneWorldTransform(bonePos("Chest"), boneEnd("Chest")), boneWorldTransforms["Chest"], bonePos(shoulder))
                         : bodyTransform.transformPoint(bonePos(shoulder));
                     Vector3 shEnd = shPos + bodyTransform.transformVector(boneEnd(shoulder) - bonePos(shoulder));
                     // Shoulder: 2 cycles/loop micro-shift
@@ -307,14 +290,18 @@ namespace biped {
 
                     Vector3 upperStart = shEnd;
                     Vector3 upperDir = bodyTransform.transformVector(boneEnd(upper) - bonePos(upper));
-                    // Upper arm: pitched forward to aim arms forward, with 3 cycle tremor
-                    double upperPitch = -0.55 * armHoldAngleFactor * channelIntensityFactor // forward extension
-                        + std::sin(tRad * 3.0 + phaseOff + 0.4) * 0.025 * channelIntensityFactor;
-                    double upperYaw = sideSign * (-0.12) * armHoldAngleFactor * channelIntensityFactor // slight inward
-                        + std::sin(tRad * 2.0 + phaseOff) * 0.015 * channelIntensityFactor;
-                    Matrix4x4 r1;
-                    r1.rotate(right, upperPitch);
-                    r1.rotate(upDir, upperYaw);
+                    // Aim in body space instead of rotating by a fixed angle from the
+                    // bind pose: A-pose and T-pose rigs both hold their hands forward.
+                    Vector3 restDir = upperDir.normalized();
+                    Vector3 outward = right * (Vector3::dotProduct(restDir, right) >= 0.0 ? 1.0 : -1.0);
+                    Vector3 aim = (forward + upDir * 0.08 + outward * 0.16).normalized();
+                    double hold = std::clamp(armHoldAngleFactor * channelIntensityFactor, 0.0, 1.0);
+                    Matrix4x4 r1 = turnAbout(Vector3(), restDir, aim, hold);
+                    Matrix4x4 tremor;
+                    tremor.rotate(right, std::sin(tRad * 3.0 + phaseOff + 0.4) * 0.025 * channelIntensityFactor);
+                    tremor.rotate(upDir, std::sin(tRad * 2.0 + phaseOff) * 0.015 * channelIntensityFactor);
+                    tremor *= r1;
+                    r1 = tremor;
                     Vector3 upperEnd = upperStart + r1.transformVector(upperDir);
                     boneWorldTransforms[upper] = buildBoneWorldTransform(upperStart, upperEnd);
 
@@ -323,7 +310,12 @@ namespace biped {
                     double elbowBend = 0.10 * armHoldAngleFactor // slight bend (not fully locked)
                         + std::sin(tRad * 5.0 + phaseOff + 1.0) * 0.020 * channelIntensityFactor;
                     Matrix4x4 r2;
-                    r2.rotate(right, upperPitch * 0.50 + elbowBend);
+                    Vector3 armAim = r1.transformVector(restDir);
+                    Vector3 elbowAxis = Vector3::crossProduct(armAim, upDir);
+                    if (elbowAxis.lengthSquared() < 1e-9)
+                        elbowAxis = right;
+                    r2.rotate(elbowAxis.normalized(), elbowBend);
+                    r2 *= r1;
                     Vector3 lowerEnd = upperEnd + r2.transformVector(lowerDir);
                     boneWorldTransforms[lower] = buildBoneWorldTransform(upperEnd, lowerEnd);
 
@@ -334,6 +326,7 @@ namespace biped {
                     Matrix4x4 r3;
                     r3.rotate(right, wristTremor);
                     r3.rotate(upDir, wristTremor * 0.5);
+                    r3 *= r2;
                     Vector3 handEnd = lowerEnd + r3.transformVector(handDir);
                     boneWorldTransforms[hand] = buildBoneWorldTransform(lowerEnd, handEnd);
                 }

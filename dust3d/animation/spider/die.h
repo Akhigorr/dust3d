@@ -33,10 +33,10 @@ namespace spider {
     bool die(const RigStructure& rigStructure,
         const std::map<std::string, Matrix4x4>& inverseBindMatrices,
         RigAnimationClip& animationClip,
-        const AnimationParams& parameters = AnimationParams());
+        const AnimationParams& parameters);
 
 } // namespace spider
 
 } // namespace dust3d
 
-#endif // DUST3D_ANIMATION_SPIDER_DIE_H_
+#endif

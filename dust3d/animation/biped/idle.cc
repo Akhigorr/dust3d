@@ -42,9 +42,11 @@
 //   - spineSwayFactor:      subtle spine lateral sway
 //   - tailIdleFactor:       tail gentle sway amplitude (if tail bones exist)
 
+#include <algorithm>
 #include <cmath>
 #include <dust3d/animation/animation_generator.h>
 #include <dust3d/animation/biped/idle.h>
+#include <dust3d/animation/biped/pose.h>
 #include <dust3d/animation/common.h>
 #include <dust3d/base/math.h>
 #include <dust3d/base/matrix4x4.h>
@@ -91,9 +93,11 @@ namespace biped {
         // 1. Idle parameters
         // ===================================================================
         double breathingAmplitudeFactor = parameters.getValue("breathingAmplitudeFactor", 1.0);
-        double breathingSpeedFactor = parameters.getValue("breathingSpeedFactor", 1.0);
+        // Whole cycles per clip, so the loop has no seam.
+        double breathingSpeedFactor = std::max(1.0, std::round(parameters.getValue("breathingSpeedFactor", 1.0)));
         double weightShiftFactor = parameters.getValue("weightShiftFactor", 1.0);
-        double weightShiftSpeedFactor = parameters.getValue("weightShiftSpeedFactor", 1.0);
+        // Whole cycles per clip, so the loop has no seam.
+        double weightShiftSpeedFactor = std::max(1.0, std::round(parameters.getValue("weightShiftSpeedFactor", 1.0)));
         double headLookFactor = parameters.getValue("headLookFactor", 1.0);
         double armRestFactor = parameters.getValue("armRestFactor", 1.0);
         double spineSwayFactor = parameters.getValue("spineSwayFactor", 1.0);
@@ -304,6 +308,7 @@ namespace biped {
             double tailPhase1 = tRadians * 1.0;
             double tailPhase2 = tRadians * 3.0;
             Vector3 prevTailEnd;
+            Vector3 prevTailRestEnd; // rigs may leave a gap between tail bones: keep it
             bool hasPrevTail = false;
             for (int ti = 0; ti < 3; ++ti) {
                 if (boneIdx.count(tailBones[ti]) == 0)
@@ -318,7 +323,7 @@ namespace biped {
                 Vector3 newEnd = bodyTransform.transformPoint(end);
                 if (hasPrevTail) {
                     Vector3 offset = newEnd - newPos;
-                    newPos = prevTailEnd;
+                    newPos = prevTailEnd + (pos - prevTailRestEnd);
                     newEnd = newPos + offset;
                 }
                 if (std::abs(tailAngle) > 1e-6) {
@@ -329,6 +334,7 @@ namespace biped {
                 }
                 boneWorldTransforms[tailBones[ti]] = buildBoneWorldTransform(newPos, newEnd);
                 prevTailEnd = newEnd;
+                prevTailRestEnd = end;
                 hasPrevTail = true;
             }
 
@@ -337,112 +343,32 @@ namespace biped {
             // connect the moved hips to the fixed foot positions.
             // Weight-bearing leg gets subtle extra knee bend.
             // -----------------------------------------------------------
-            double weightOnLeft = -lateralShift / (weightShiftAmp + 1e-8); // -1..+1
-            double weightOnRight = -weightOnLeft;
-
-            auto computeLegPlanted = [&](const char* upperLegName, const char* lowerLegName,
-                                         const char* footName, double weightFraction) {
-                // Foot stays at bind pose (no body transform applied)
-                Vector3 footStart = bonePos(footName);
-                Vector3 footEnd = boneEnd(footName);
-                boneWorldTransforms[footName] = buildBoneWorldTransform(footStart, footEnd);
-
-                // Upper leg origin follows the body (hips moved)
-                Vector3 hipJoint = bodyTransform.transformPoint(bonePos(upperLegName));
-                double upperLen = (boneEnd(upperLegName) - bonePos(upperLegName)).length();
-                double lowerLen = (boneEnd(lowerLegName) - bonePos(lowerLegName)).length();
-
-                // Target: knee must reach from hipJoint to footStart
-                Vector3 toFoot = footStart - hipJoint;
-                double dist = toFoot.length();
-                double totalLen = upperLen + lowerLen;
-                if (dist < 1e-6)
-                    dist = 1e-6;
-                if (dist > totalLen * 0.999)
-                    dist = totalLen * 0.999;
-
-                // Two-bone IK: law of cosines for knee angle
-                double cosKnee = (upperLen * upperLen + lowerLen * lowerLen - dist * dist) / (2.0 * upperLen * lowerLen);
-                cosKnee = std::max(-1.0, std::min(1.0, cosKnee));
-
-                // Angle at hip
-                double cosHip = (upperLen * upperLen + dist * dist - lowerLen * lowerLen) / (2.0 * upperLen * dist);
-                cosHip = std::max(-1.0, std::min(1.0, cosHip));
-                double hipAngle = std::acos(cosHip);
-
-                // Weight-bearing knee flex: slightly more bend
-                double extraFlex = 0.015 * std::max(0.0, weightFraction) * weightShiftFactor;
-                hipAngle += extraFlex;
-
-                // Build upper leg direction: rotate toFoot by hipAngle toward forward (knee hint)
-                Vector3 toFootDir = toFoot;
-                toFootDir.normalize();
-                // Knee hint direction: forward of character
-                Vector3 kneeHint = forward;
-                Vector3 bendAxis = Vector3::crossProduct(toFootDir, kneeHint);
-                if (bendAxis.lengthSquared() < 1e-8)
-                    bendAxis = right;
-                bendAxis.normalize();
-
-                Matrix4x4 hipRot;
-                hipRot.rotate(bendAxis, hipAngle);
-                Vector3 upperDir = hipRot.transformVector(toFootDir);
-                Vector3 kneePos = hipJoint + upperDir * upperLen;
-
-                boneWorldTransforms[upperLegName] = buildBoneWorldTransform(hipJoint, kneePos);
-                boneWorldTransforms[lowerLegName] = buildBoneWorldTransform(kneePos, footStart);
-            };
-
-            computeLegPlanted("LeftUpperLeg", "LeftLowerLeg", "LeftFoot", weightOnLeft);
-            computeLegPlanted("RightUpperLeg", "RightLowerLeg", "RightFoot", weightOnRight);
+            // Preserve the rig's knee bend and joint offsets. A fixed forward
+            // pole can replace an animal's resting leg shape at every idle frame.
+            for (const std::string prefix : { "Left", "Right" })
+                posePlantedLeg(rigStructure, boneIdx, prefix + "UpperLeg", prefix + "LowerLeg",
+                    prefix + "Foot", bodyTransform, Vector3(), boneWorldTransforms);
 
             // -----------------------------------------------------------
             // Arms: breathing-coupled sway + gravity drape
             // Each arm sways slightly with breathing and has a secondary
             // frequency for organic feel. Counter-swing with shoulders.
             // -----------------------------------------------------------
-            auto computeArmIdle = [&](const char* shoulderName, const char* upperArmName,
-                                      const char* lowerArmName, const char* handName,
-                                      double phase, double sideShoulderTilt) {
-                // Layered arm sway
+            const auto restWorld = restBoneWorldTransforms(rigStructure);
+            Matrix4x4 chestLayer = boneWorldTransforms.at("Chest");
+            chestLayer *= restWorld.at("Chest").inverted();
+            for (const std::string prefix : { "Left", "Right" }) {
+                double phase = prefix == "Left" ? 0.0 : Math::Pi;
                 double armSway = armRestFactor * (0.018 * std::sin(breathPhase1 + phase) + 0.008 * std::sin(breathPhase2 + phase + 0.5));
-
-                Vector3 shoulderPos = bodyTransform.transformPoint(bonePos(shoulderName));
-                Vector3 shoulderEnd = bodyTransform.transformPoint(boneEnd(shoulderName));
-                // Apply shoulder tilt from contra-posto
-                if (std::abs(sideShoulderTilt) > 1e-6) {
-                    Matrix4x4 sTilt;
-                    sTilt.rotate(forward, sideShoulderTilt);
-                    Vector3 sOff = shoulderEnd - shoulderPos;
-                    shoulderEnd = shoulderPos + sTilt.transformVector(sOff);
-                }
-                boneWorldTransforms[shoulderName] = buildBoneWorldTransform(shoulderPos, shoulderEnd);
-
-                Vector3 upperArmStart = shoulderEnd;
-                Vector3 upperArmEndRest = bodyTransform.transformPoint(boneEnd(upperArmName));
-                Vector3 armDir = upperArmEndRest - upperArmStart;
-                Matrix4x4 swayMat;
-                swayMat.rotate(right, armSway);
-                Vector3 newUpperArmEnd = upperArmStart + swayMat.transformVector(armDir);
-                boneWorldTransforms[upperArmName] = buildBoneWorldTransform(upperArmStart, newUpperArmEnd);
-
-                // Lower arm: slightly more sway (pendulum effect)
-                Matrix4x4 lowerSwayMat;
-                lowerSwayMat.rotate(right, armSway * 1.3);
-                Vector3 lowerArmDir = bodyTransform.transformPoint(boneEnd(lowerArmName)) - bodyTransform.transformPoint(boneEnd(upperArmName));
-                Vector3 newLowerArmEnd = newUpperArmEnd + lowerSwayMat.transformVector(lowerArmDir);
-                boneWorldTransforms[lowerArmName] = buildBoneWorldTransform(newUpperArmEnd, newLowerArmEnd);
-
-                // Hand: even more pendulum lag
-                Matrix4x4 handSwayMat;
-                handSwayMat.rotate(right, armSway * 1.5);
-                Vector3 handDir = bodyTransform.transformPoint(boneEnd(handName)) - bodyTransform.transformPoint(boneEnd(lowerArmName));
-                Vector3 newHandEnd = newLowerArmEnd + handSwayMat.transformVector(handDir);
-                boneWorldTransforms[handName] = buildBoneWorldTransform(newLowerArmEnd, newHandEnd);
-            };
-
-            computeArmIdle("LeftShoulder", "LeftUpperArm", "LeftLowerArm", "LeftHand", 0.0, shoulderTilt);
-            computeArmIdle("RightShoulder", "RightUpperArm", "RightLowerArm", "RightHand", Math::Pi, -shoulderTilt);
+                Matrix4x4 sway;
+                sway.rotate(right, armSway);
+                Vector3 u = relaxedArm(rigStructure, boneIdx, prefix + "UpperArm", parameters)
+                                .transformVector(boneEnd(prefix + "UpperArm") - bonePos(prefix + "UpperArm"));
+                Vector3 l = relaxedForearm(rigStructure, boneIdx, prefix, parameters)
+                                .transformVector(boneEnd(prefix + "LowerArm") - bonePos(prefix + "LowerArm"));
+                aimArm(rigStructure, boneIdx, restWorld, boneWorldTransforms, prefix, chestLayer,
+                    chestLayer.transformVector(sway.transformVector(u)), chestLayer.transformVector(sway.transformVector(l)), 1.0, parameters);
+            }
 
             // Hair physics step: inertial follow with gravity drape.
             if (hairSim.active)

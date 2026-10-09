@@ -1,6 +1,7 @@
 #ifndef DUST3D_APPLICATION_DOCUMENT_H_
 #define DUST3D_APPLICATION_DOCUMENT_H_
 
+#include "background_task_group.h"
 #include "bone_structure.h"
 #include "debug.h"
 #include "model_mesh.h"
@@ -31,6 +32,8 @@ class RigGeneratorWorker;
 class Document : public QObject {
     Q_OBJECT
 public:
+    // Qt resource paths of the rig templates compiled into the application
+    static const QStringList& rigTemplateFiles();
     enum class EditMode {
         Add = 0,
         Select,
@@ -79,6 +82,8 @@ public:
         dust3d::CutFace cutFace = dust3d::CutFace::Quad;
         dust3d::Uuid cutFaceLinkedId;
         bool hasCutFaceSettings = false;
+        float deformWidth = 1.0; // per-node cross-section scale (tapers that differ per direction)
+        float deformThickness = 1.0;
         std::vector<dust3d::Uuid> edgeIds;
 
     private:
@@ -110,6 +115,8 @@ public:
         float deformThickness;
         float deformWidth;
         bool deformUnified;
+        bool interpolated; // false: no extra rings along long edges (rigid parts, fewer triangles)
+        bool hard; // hard-surface: joins other parts with a crisp boolean edge, no smooth bridging
         bool rounded;
         bool chamfered;
         bool fillLoopInterior;
@@ -122,6 +129,7 @@ public:
         dust3d::PartTarget target;
         float metalness;
         float roughness;
+        float emissive = 0.0f; // glow strength, 0..1: baked into the emissive texture on export
         float hollowThickness;
         dust3d::Uuid importedModelId;
         Part(const dust3d::Uuid& withId = dust3d::Uuid());
@@ -178,6 +186,9 @@ public:
         float backCloseSharpness = 0.0;
         size_t targetSegments = 0;
         float smoothCutoffDegrees = 0.0;
+        // Wrap modifier of a group: "wrap" (Skin | Cloth) and its "wrap..." settings,
+        // stored as they go into the snapshot. Empty when the group is a plain group.
+        std::map<std::string, std::string> wrap;
         bool dirty = true;
         std::vector<dust3d::Uuid> childrenIds;
         bool isPreviewMeshObsolete = false;
@@ -264,6 +275,7 @@ signals:
     void componentBackCloseStateChanged(const dust3d::Uuid& componentId);
     void componentBackCloseDepthRatioChanged(const dust3d::Uuid& componentId);
     void componentBackCloseSharpnessChanged(const dust3d::Uuid& componentId);
+    void componentWrapChanged(const dust3d::Uuid& componentId);
     void nodeRemoved(dust3d::Uuid nodeId);
     void edgeRemoved(dust3d::Uuid edgeId);
     void nodeRadiusChanged(dust3d::Uuid nodeId);
@@ -293,6 +305,7 @@ public: // need initialize
     std::unique_ptr<QImage> textureMetalnessImage;
     std::unique_ptr<QImage> textureRoughnessImage;
     std::unique_ptr<QImage> textureAmbientOcclusionImage;
+    std::unique_ptr<QImage> textureEmissiveImage;
     bool weldEnabled = true;
     float brushMetalness = ModelMesh::m_defaultMetalness;
     float brushRoughness = ModelMesh::m_defaultRoughness;
@@ -344,6 +357,7 @@ public:
     void updateTextureMetalnessImage(QImage* image);
     void updateTextureRoughnessImage(QImage* image);
     void updateTextureAmbientOcclusionImage(QImage* image);
+    void updateTextureEmissiveImage(QImage* image);
     const dust3d::Object& currentUvMappedObject() const;
     const RigStructure& currentActualRigStructure() const;
     bool isExportReady() const;
@@ -467,9 +481,12 @@ public slots:
     void setPartCutFace(dust3d::Uuid partId, dust3d::CutFace cutFace);
     void setPartCutFaceLinkedId(dust3d::Uuid partId, dust3d::Uuid linkedId);
     void setPartChamferState(dust3d::Uuid partId, bool chamfered);
+    void setPartHardState(dust3d::Uuid partId, bool hard);
+    void setPartInterpolatedState(dust3d::Uuid partId, bool interpolated);
     void setPartTarget(dust3d::Uuid partId, dust3d::PartTarget target);
     void setPartMetalness(dust3d::Uuid partId, float metalness);
     void setPartRoughness(dust3d::Uuid partId, float roughness);
+    void setPartEmissive(dust3d::Uuid partId, float emissive);
     void setPartHollowThickness(dust3d::Uuid partId, float hollowThickness);
     void setPartImportedModelId(dust3d::Uuid partId, dust3d::Uuid importedModelId);
     void setComponentSmoothCutoffDegrees(dust3d::Uuid componentId, float degrees);
@@ -516,6 +533,9 @@ public slots:
     void setComponentBackCloseState(const dust3d::Uuid& componentId, bool closed);
     void setComponentBackCloseDepthRatio(const dust3d::Uuid& componentId, float depthRatio);
     void setComponentBackCloseSharpness(const dust3d::Uuid& componentId, float sharpness);
+    // name: "wrap" or one of its settings ("wrapOffset", ...); an empty value removes it
+    // (removing "wrap" turns the modifier off and removes every setting).
+    void setComponentWrapAttribute(const dust3d::Uuid& componentId, const QString& name, const QString& value);
     void hideOtherComponents(dust3d::Uuid componentId);
     void showAllOrHideOtherComponents(dust3d::Uuid componentId);
     void lockOtherComponents(dust3d::Uuid componentId);
@@ -571,6 +591,7 @@ private:
     void updateLinkedPart(dust3d::Uuid oldPartId, dust3d::Uuid newPartId);
     dust3d::Uuid createNode(dust3d::Uuid nodeId, float x, float y, float z, float radius, dust3d::Uuid fromNodeId);
 
+    BackgroundTaskGroup m_backgroundTasks;
     bool m_isResultMeshObsolete = false;
     MeshGenerator* m_meshGenerator = nullptr;
     QThread* m_meshGeneratorThread = nullptr;

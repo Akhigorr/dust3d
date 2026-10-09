@@ -38,6 +38,7 @@ MeshState::MeshState(const MeshState& other)
     if (nullptr != other.mesh)
         mesh = std::make_unique<MeshCombiner::Mesh>(*other.mesh);
     seamTriangleUvs = other.seamTriangleUvs;
+    seamReports = other.seamReports;
 }
 
 void MeshState::fetch(std::vector<Vector3>& vertices, std::vector<std::vector<size_t>>& faces) const
@@ -54,7 +55,7 @@ bool MeshState::isNull() const
 }
 
 std::unique_ptr<MeshState> MeshState::combine(const MeshState& first, const MeshState& second,
-    MeshCombiner::Method method)
+    MeshCombiner::Method method, bool recombine)
 {
     if (first.mesh->isNull() || second.mesh->isNull())
         return nullptr;
@@ -66,7 +67,7 @@ std::unique_ptr<MeshState> MeshState::combine(const MeshState& first, const Mesh
         &combinedVerticesSources));
     if (nullptr == newMesh)
         return nullptr;
-    if (!newMesh->isNull()) {
+    if (recombine && !newMesh->isNull()) {
         MeshRecombiner recombiner;
         std::vector<Vector3> combinedVertices;
         std::vector<std::vector<size_t>> combinedFaces;
@@ -74,6 +75,7 @@ std::unique_ptr<MeshState> MeshState::combine(const MeshState& first, const Mesh
         recombiner.setVertices(&combinedVertices, &combinedVerticesSources);
         recombiner.setFaces(&combinedFaces);
         if (recombiner.recombine()) {
+            newMeshState->seamReports = recombiner.seamReports();
             auto reMesh = std::make_unique<MeshCombiner::Mesh>(recombiner.regeneratedVertices(), recombiner.regeneratedFaces());
             if (!reMesh->isNull()) {
                 for (const auto& bridgingTriangles : recombiner.generatedBridgingTriangles()) {

@@ -25,6 +25,7 @@
 
 #include <dust3d/base/position_key.h>
 #include <dust3d/mesh/mesh_combiner.h>
+#include <dust3d/mesh/mesh_recombiner.h>
 #include <map>
 #include <set>
 
@@ -35,14 +36,18 @@ public:
     std::unique_ptr<MeshCombiner::Mesh> mesh;
     std::vector<std::pair<std::set<std::array<PositionKey, 3>>, std::set<std::array<PositionKey, 3>>>> seamTriangleUvs;
     std::vector<std::array<PositionKey, 3>> brokenTriangles;
+    // Seam diagnostics of the combine() that produced this state
+    std::vector<MeshRecombiner::SeamReport> seamReports;
 
     MeshState() = default;
     MeshState(const std::vector<Vector3>& vertices, const std::vector<std::vector<size_t>>& faces);
     MeshState(const MeshState& other);
     void fetch(std::vector<Vector3>& vertices, std::vector<std::vector<size_t>>& faces) const;
     bool isNull() const;
+    // recombine: rebuild the join with smooth bridging (organic parts). A hard-surface join
+    // keeps the plain boolean result: crisp edges where the parts meet.
     static std::unique_ptr<MeshState> combine(const MeshState& first, const MeshState& second,
-        MeshCombiner::Method method);
+        MeshCombiner::Method method, bool recombine = true);
     static bool isWatertight(const std::vector<std::vector<size_t>>& faces);
 };
 

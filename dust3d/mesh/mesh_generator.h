@@ -31,6 +31,7 @@
 #include <dust3d/mesh/mesh_combiner.h>
 #include <dust3d/mesh/mesh_node.h>
 #include <dust3d/mesh/mesh_state.h>
+#include <dust3d/mesh/wrap_mesh_builder.h>
 #include <set>
 #include <tuple>
 #include <unordered_map>
@@ -82,9 +83,24 @@ public:
         std::map<Uuid, ObjectNode> nodeMap;
         std::map<PositionKey, Color> importedVertexColorMap;
         std::map<std::array<PositionKey, 3>, std::array<Vector3, 3>> importedTriangleNormals;
+        std::map<PositionKey, std::vector<std::pair<Uuid, float>>> positionToNodeWeights;
+        std::map<PositionKey, ObjectVertexAttribute> positionToVertexAttribute;
+        // The wrap surface of a cloth component: emitted as its own mesh, next to the
+        // children it wraps (which are kept).
+        std::unique_ptr<GeneratedComponent> wrapOutput;
+        // The colour a wrap without its own colour took from what it wraps.
+        std::string wrapColor;
+        // The folds placed on a wrap with wrinkles (ClothFolds::serialize), for the
+        // texture generator, which bakes them.
+        std::string wrapFolds;
         void reset()
         {
+            wrapColor.clear();
+            wrapFolds.clear();
             mesh.reset();
+            positionToNodeWeights.clear();
+            positionToVertexAttribute.clear();
+            wrapOutput.reset();
             sharedQuadEdges.clear();
             componentTriangleUvs.clear();
             brokenTriangles.clear();
@@ -101,6 +117,8 @@ public:
         std::map<std::string, GeneratedPart> parts;
         std::map<std::string, std::string> partMirrorIdMap;
         std::map<std::string, std::unique_ptr<MeshState>> cachedCombination;
+        // Wrap surfaces and weights by their inputs (see WrapMeshBuilder::Cache).
+        WrapMeshBuilder::Cache wrapCache;
     };
 
     struct ComponentPreview {
@@ -149,6 +167,7 @@ private:
     GeneratedCacheContext* m_cacheContext = nullptr;
     std::set<std::string> m_dirtyComponentIds;
     std::set<std::string> m_dirtyPartIds;
+    std::set<std::string> m_generatedComponentIds;
     float m_mainProfileMiddleX = 0;
     float m_sideProfileMiddleX = 0;
     float m_mainProfileMiddleY = 0;
@@ -162,7 +181,7 @@ private:
 
     void collectParts();
     void interpolateEdgesAroundJoints();
-    void collectIncombinableMesh(const MeshState* mesh, const GeneratedComponent& componentCache);
+    void collectIncombinableMesh(const MeshState* mesh, const GeneratedComponent& componentCache, const Uuid& componentId = Uuid());
     bool checkIsComponentDirty(const std::string& componentIdString);
     bool checkIsPartDirty(const std::string& partIdString);
     bool checkIsPartDependencyDirty(const std::string& partIdString);
@@ -203,12 +222,39 @@ private:
         float smoothCutoffDegrees,
         GeneratedComponent& componentCache);
     void collectUncombinedComponent(const std::string& componentIdString);
+    static bool isWrapComponent(const std::map<std::string, std::string>* component);
+    static bool wrapKeepsChildren(const std::map<std::string, std::string>* component);
+    std::unique_ptr<MeshState> buildWrapMesh(const std::string& componentIdString,
+        const std::map<std::string, std::string>& component,
+        const Color& color,
+        float smoothCutoffDegrees,
+        GeneratedComponent& output);
+    // The bind samples of a body (see WrapMeshBuilder::addBindSample), and its surface
+    // (when `surfaceVertices` is given): the meshes of the parts that make it.
+    void collectBindSamples(const std::string& componentIdString,
+        WrapMeshBuilder* builder,
+        int depth = 0,
+        std::vector<Vector3>* surfaceVertices = nullptr,
+        std::vector<std::vector<size_t>>* surfaceFaces = nullptr);
+    void collectWrapSources(const std::string& componentIdString,
+        bool subtract,
+        WrapMeshBuilder* builder,
+        size_t* sourceCount);
     void collectBrokenTriangles(const std::string& componentIdString);
     void cutFaceStringToCutTemplate(const std::string& cutFaceString, std::vector<Vector2>& cutTemplate);
     void postprocessObject(Object* object);
     void preprocessMirror();
     std::string reverseUuid(const std::string& uuidString);
+    static bool seamReportEnabled();
+    std::string componentDisplayName(const std::string& componentIdString);
+    std::string seamReportNames(const std::string& subMeshIdString);
+    bool isHardComponent(const std::string& componentIdString, int depth = 0);
+    void reportFailedCombine(const std::string& subMeshIdString, const std::string& method);
+    void reportSeams(const std::string& subMeshIdString, const std::string& method,
+        const std::vector<MeshRecombiner::SeamReport>& reports);
     void recoverQuads(const std::vector<Vector3>& vertices, const std::vector<std::vector<size_t>>& triangles, const std::set<std::pair<PositionKey, PositionKey>>& sharedQuadEdges, std::vector<std::vector<size_t>>& triangleAndQuads);
+    void generateDisabledComponentPreviews();
+    void collectComponentPreview(const std::string& componentIdString, bool includeMesh, ComponentPreview& preview);
     void addComponentPreview(const Uuid& componentId, ComponentPreview&& preview);
     bool fetchPartOrderedNodes(const std::string& partIdString, bool xMirrored, std::vector<MeshNode>* meshNodes, bool* isCircle);
 

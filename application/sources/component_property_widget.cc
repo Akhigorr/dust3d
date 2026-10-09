@@ -5,6 +5,7 @@
 #include "glb_forever.h"
 #include "image_forever.h"
 #include "image_preview_widget.h"
+#include "int_number_widget.h"
 #include "theme.h"
 #include <QColorDialog>
 #include <QComboBox>
@@ -13,11 +14,15 @@
 #include <QGraphicsOpacityEffect>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
+#include <QPointer>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QVBoxLayout>
 #include <QtGlobal>
+#include <set>
 #include <unordered_set>
 
 ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
@@ -349,16 +354,44 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
             emit groupOperationAdded();
         });
 
+        QCheckBox* hardStateBox = new QCheckBox();
+        Theme::initCheckbox(hardStateBox);
+        hardStateBox->setText(tr("Hard edges"));
+        hardStateBox->setToolTip(tr("Join other parts with a crisp boolean edge instead of a smooth blend (machines, props)"));
+        hardStateBox->setChecked(m_part->hard);
+
+        connect(hardStateBox, checkboxStateChangedSignal, this, [=]() {
+            emit setPartHardState(m_partId, hardStateBox->isChecked());
+            emit groupOperationAdded();
+        });
+
+        QCheckBox* interpolatedStateBox = new QCheckBox();
+        Theme::initCheckbox(interpolatedStateBox);
+        interpolatedStateBox->setText(tr("Extra rings"));
+        interpolatedStateBox->setToolTip(tr("Add rings along long edges so the part bends smoothly; turn off for rigid, low-poly parts"));
+        interpolatedStateBox->setChecked(m_part->interpolated);
+
+        connect(interpolatedStateBox, checkboxStateChangedSignal, this, [=]() {
+            emit setPartInterpolatedState(m_partId, interpolatedStateBox->isChecked());
+            emit groupOperationAdded();
+        });
+
         QHBoxLayout* optionsLayout = new QHBoxLayout;
         optionsLayout->addStretch();
         optionsLayout->addWidget(roundEndStateBox);
         optionsLayout->addWidget(chamferStateBox);
         optionsLayout->addWidget(subdivStateBox);
 
+        QHBoxLayout* hardSurfaceLayout = new QHBoxLayout;
+        hardSurfaceLayout->addStretch();
+        hardSurfaceLayout->addWidget(hardStateBox);
+        hardSurfaceLayout->addWidget(interpolatedStateBox);
+
         QVBoxLayout* cutFaceLayout = new QVBoxLayout;
         cutFaceLayout->addLayout(cutFaceIconLayout);
         cutFaceLayout->addLayout(rotationLayout);
         cutFaceLayout->addLayout(optionsLayout);
+        cutFaceLayout->addLayout(hardSurfaceLayout);
 
         cutFaceGroupBox = new QGroupBox(tr("Cut Face"));
         cutFaceGroupBox->setLayout(cutFaceLayout);
@@ -394,6 +427,71 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
 
         smoothGroupBox = new QGroupBox(tr("Normal Smooth"));
         smoothGroupBox->setLayout(smoothGroupLayout);
+    }
+
+    QGroupBox* materialGroupBox = nullptr;
+    if (nullptr != m_part && dust3d::PartTarget::Model == m_part->target) {
+        // metallic, roughness and glow: baked into the exported texture maps per part
+        auto addSlider = [&](QVBoxLayout* layout, const QString& name, float value, float reset,
+                             std::function<void(float)> apply, float maxValue = 1.0) {
+            FloatNumberWidget* widget = new FloatNumberWidget;
+            widget->setItemName(name);
+            widget->setRange(0.0, maxValue);
+            widget->setValue(value);
+            connect(widget, &FloatNumberWidget::valueChanged, [=](float v) {
+                apply(v);
+                emit groupOperationAdded();
+            });
+            QPushButton* eraser = new QPushButton(Theme::awesome()->icon(fa::eraser), "");
+            Theme::initIconButton(eraser);
+            connect(eraser, &QPushButton::clicked, [=]() {
+                widget->setValue(reset);
+                emit groupOperationAdded();
+            });
+            QHBoxLayout* row = new QHBoxLayout;
+            row->addWidget(eraser);
+            row->addWidget(widget);
+            layout->addLayout(row);
+        };
+        QVBoxLayout* materialLayout = new QVBoxLayout;
+        addSlider(materialLayout, tr("Metallic"), m_part->metalness, 0.0, [=](float v) { emit setPartMetalness(m_partId, v); });
+        addSlider(materialLayout, tr("Roughness"), m_part->roughness, 1.0, [=](float v) { emit setPartRoughness(m_partId, v); });
+        addSlider(materialLayout, tr("Glow"), m_part->emissive, 0.0, [=](float v) { emit setPartEmissive(m_partId, v); }, 2.0);
+        materialGroupBox = new QGroupBox(tr("Material"));
+        materialGroupBox->setLayout(materialLayout);
+    }
+
+    // Equipment slot: a part tagged "armor/2" is exported as part of the "armor" slot's
+    // variant "2" (glTF mesh extras); game tools split each variant into its own mesh on the
+    // same skeleton, so a game can show the equipped one. Stored as a suffix of the
+    // component name ("vest @armor/2"), which is also how it shows in the part list.
+    QGroupBox* slotGroupBox = nullptr;
+    if (1 == m_componentIds.size() && nullptr != m_part && dust3d::PartTarget::Model == m_part->target) {
+        const Document::Component* component = m_document->findComponent(m_componentIds.front());
+        if (nullptr != component) {
+            QString fullName = component->name;
+            int mark = fullName.lastIndexOf(" @");
+            QString baseName = mark >= 0 ? fullName.left(mark) : fullName;
+            QString slot = mark >= 0 ? fullName.mid(mark + 2) : QString();
+            QLineEdit* slotEdit = new QLineEdit(slot);
+            slotEdit->setPlaceholderText(tr("slot/variant, e.g. armor/2"));
+            slotEdit->setToolTip(tr("Equipment slot and variant. Leave empty for a part that is always shown."));
+            dust3d::Uuid componentId = m_componentIds.front();
+            connect(slotEdit, &QLineEdit::editingFinished, this, [=]() {
+                QString value = slotEdit->text().trimmed();
+                QString name = value.isEmpty() ? baseName : baseName + " @" + value;
+                const Document::Component* current = m_document->findComponent(componentId);
+                if (nullptr == current || current->name == name)
+                    return;
+                m_document->renameComponent(componentId, name);
+                emit groupOperationAdded();
+            });
+            QHBoxLayout* slotLayout = new QHBoxLayout;
+            slotLayout->addWidget(new QLabel(tr("Slot")));
+            slotLayout->addWidget(slotEdit);
+            slotGroupBox = new QGroupBox(tr("Equipment"));
+            slotGroupBox->setLayout(slotLayout);
+        }
     }
 
     QGroupBox* colorImageGroupBox = nullptr;
@@ -600,6 +698,302 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
         stitchingLoopGroupBox->setLayout(stitchingLoopLayout);
     }
 
+    QGroupBox* wrapGroupBox = nullptr;
+    if (!m_componentIds.empty() && nullptr == m_part && hasGroupsOnly()) {
+        // The wrap modifier: one surface wrapped around everything the group generates.
+        QComboBox* wrapModeComboBox = new QComboBox;
+        wrapModeComboBox->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+        wrapModeComboBox->addItem(tr("None"), QString());
+        wrapModeComboBox->addItem(tr("Creature Skin"), QString("Skin"));
+        wrapModeComboBox->addItem(tr("Cloth"), QString("Cloth"));
+        wrapModeComboBox->setToolTip(tr("Creature Skin replaces the children with one seamless skin over them.\n"
+                                        "Cloth keeps the children and adds a loose garment over them."));
+        QString mode = lastWrapAttribute("wrap");
+        wrapModeComboBox->setCurrentIndex("Skin" == mode ? 1 : ("Cloth" == mode ? 2 : 0));
+        bool cloth = "Cloth" == mode;
+
+        auto floatValue = [&](const std::string& name, float defaultValue) {
+            QString value = lastWrapAttribute(name);
+            return value.isEmpty() ? defaultValue : value.toFloat();
+        };
+        struct Setting {
+            const char* name;
+            QString label;
+            float minValue;
+            float maxValue;
+            float defaultValue;
+            bool clothOnly;
+        };
+        std::vector<Setting> settings = {
+            { "wrapOffset", tr("Offset"), 0.0f, 0.1f, cloth ? 0.012f : 0.0f, false },
+            { "wrapSmoothness", tr("Smoothness"), 0.0f, 0.15f, cloth ? 0.05f : 0.02f, false },
+            { "wrapDrape", tr("Drape"), 0.0f, 1.0f, cloth ? 0.5f : 0.0f, true },
+            { "wrapDrapeLength", tr("Drape Length"), 0.0f, 0.5f, 0.0f, true },
+            { "wrapOpenTop", tr("Open Top"), 0.0f, 0.45f, 0.0f, true },
+            { "wrapOpenBottom", tr("Open Bottom"), 0.0f, 0.45f, 0.0f, true },
+            { "wrapThickness", tr("Thickness"), 0.0f, 0.02f, cloth ? 0.004f : 0.0f, true },
+        };
+        QWidget* wrapSettingsWidget = new QWidget;
+        QVBoxLayout* wrapSettingsLayout = new QVBoxLayout;
+        wrapSettingsLayout->setContentsMargins(0, 0, 0, 0);
+        for (const auto& setting : settings) {
+            if (setting.clothOnly && !cloth)
+                continue;
+            FloatNumberWidget* widget = new FloatNumberWidget;
+            widget->setItemName(setting.label);
+            widget->setRange(setting.minValue, setting.maxValue);
+            widget->setValue(floatValue(setting.name, setting.defaultValue));
+            std::string name = setting.name;
+            connect(widget, &FloatNumberWidget::valueChanged, [=](float value) {
+                for (const auto& componentId : m_componentIds)
+                    emit setComponentWrapAttribute(componentId, QString::fromStdString(name), QString::number(value));
+                emit groupOperationAdded();
+            });
+            wrapSettingsLayout->addWidget(widget);
+        }
+        QCheckBox* keepBox = new QCheckBox();
+        Theme::initCheckbox(keepBox);
+        keepBox->setText(tr("Keep Children"));
+        keepBox->setToolTip(tr("Show the children under the wrap (a garment over the body).\n"
+                               "Off: the children only shape the wrap (a skin, or a garment over guide shapes)."));
+        QString keepValue = lastWrapAttribute("wrapKeep");
+        keepBox->setChecked(keepValue.isEmpty() ? cloth : ("true" == keepValue));
+        connect(keepBox, checkboxStateChangedSignal, this, [=]() {
+            for (const auto& componentId : m_componentIds)
+                emit setComponentWrapAttribute(componentId, "wrapKeep", keepBox->isChecked() ? "true" : "false");
+            emit groupOperationAdded();
+        });
+        QHBoxLayout* keepLayout = new QHBoxLayout;
+        keepLayout->addStretch();
+        keepLayout->addWidget(keepBox);
+        wrapSettingsLayout->addLayout(keepLayout);
+
+        // Weights From: a garment can take its skin weights from the body it is worn over
+        QComboBox* bindToComboBox = new QComboBox;
+        bindToComboBox->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+        bindToComboBox->setToolTip(tr("Where the skin weights come from.\n"
+                                      "Pick the body a garment is worn over: both then bend alike and the body stays inside."));
+        bindToComboBox->addItem(tr("Weights: Own Children"), QString());
+        {
+            std::set<dust3d::Uuid> excluded(m_componentIds.begin(), m_componentIds.end());
+            std::vector<dust3d::Uuid> stack(m_componentIds.begin(), m_componentIds.end());
+            while (!stack.empty()) {
+                const Document::Component* component = m_document->findComponent(stack.back());
+                stack.pop_back();
+                if (nullptr == component)
+                    continue;
+                for (const auto& childId : component->childrenIds) {
+                    excluded.insert(childId);
+                    stack.push_back(childId);
+                }
+            }
+            QString current = lastWrapAttribute("wrapBindTo");
+            for (const auto& it : m_document->componentMap) {
+                if (!it.second.linkToPartId.isNull() || excluded.count(it.first))
+                    continue;
+                QString name = it.second.name.isEmpty() ? tr("Group") : it.second.name;
+                QString idString = QString::fromStdString(it.first.toString());
+                bindToComboBox->addItem(tr("Weights: %1").arg(name), idString);
+                if (idString == current)
+                    bindToComboBox->setCurrentIndex(bindToComboBox->count() - 1);
+            }
+        }
+        connect(bindToComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [=](int index) {
+            QString value = bindToComboBox->itemData(index).toString();
+            for (const auto& componentId : m_componentIds)
+                emit setComponentWrapAttribute(componentId, "wrapBindTo", value);
+            emit groupOperationAdded();
+        });
+        QHBoxLayout* bindToLayout = new QHBoxLayout;
+        bindToLayout->addWidget(bindToComboBox);
+        bindToLayout->addStretch();
+        wrapSettingsLayout->addLayout(bindToLayout);
+
+        IntNumberWidget* facesWidget = new IntNumberWidget;
+        facesWidget->setItemName(tr("Faces"));
+        facesWidget->setRange(64, 20000);
+        facesWidget->setValue((int)floatValue("wrapFaces", cloth ? 1200.0f : 1600.0f));
+        connect(facesWidget, &IntNumberWidget::valueChanged, [=](int value) {
+            for (const auto& componentId : m_componentIds)
+                emit setComponentWrapAttribute(componentId, "wrapFaces", QString::number(value));
+            emit groupOperationAdded();
+        });
+        wrapSettingsLayout->addWidget(facesWidget);
+
+        // Animal skin pattern, painted into the texture from the 3D surface (no seams)
+        QComboBox* patternComboBox = new QComboBox;
+        patternComboBox->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+        patternComboBox->setToolTip(tr("An animal coat painted into the texture: spots (cheetah), rosettes (leopard),\n"
+                                       "stripes (tiger, zebra), patches (giraffe) or mottled (frog, camouflage)."));
+        patternComboBox->addItem(tr("Pattern: None"), QString());
+        patternComboBox->addItem(tr("Pattern: Spots"), QString("Spots"));
+        patternComboBox->addItem(tr("Pattern: Rosettes"), QString("Rosettes"));
+        patternComboBox->addItem(tr("Pattern: Stripes"), QString("Stripes"));
+        patternComboBox->addItem(tr("Pattern: Patches"), QString("Patches"));
+        patternComboBox->addItem(tr("Pattern: Mottled"), QString("Mottled"));
+        QString patternValue = lastWrapAttribute("wrapPattern");
+        for (int i = 0; i < patternComboBox->count(); ++i) {
+            if (patternComboBox->itemData(i).toString() == patternValue)
+                patternComboBox->setCurrentIndex(i);
+        }
+        QWidget* patternDetailsWidget = new QWidget;
+        QVBoxLayout* patternDetailsLayout = new QVBoxLayout;
+        patternDetailsLayout->setContentsMargins(0, 0, 0, 0);
+
+        QPushButton* patternColorButton = new QPushButton;
+        patternColorButton->setToolTip(tr("The colour of the pattern (Auto: a dark tone of the base colour)"));
+        auto showPatternColor = [patternColorButton](const QString& value) {
+            if (value.isEmpty()) {
+                patternColorButton->setText(tr("Pattern Colour: Auto"));
+                patternColorButton->setStyleSheet(QString());
+            } else {
+                patternColorButton->setText(tr("Pattern Colour"));
+                QColor color(value);
+                patternColorButton->setStyleSheet("QPushButton {background-color: " + color.name() + "; color: "
+                    + (color.lightness() > 128 ? "black" : "white") + ";}");
+            }
+        };
+        showPatternColor(lastWrapAttribute("wrapPatternColor"));
+        connect(patternColorButton, &QPushButton::clicked, this, [=]() {
+            // the dialog lives on the main window and talks to the document directly: this
+            // widget sits in a popup menu that closes as soon as the dialog takes focus
+            QPointer<Document> document = m_document;
+            std::vector<dust3d::Uuid> componentIds = m_componentIds;
+            QString initial = lastWrapAttribute("wrapPatternColor");
+            QWidget* host = nullptr != window()->parentWidget() ? window()->parentWidget()->window() : nullptr;
+            QColorDialog* dialog = new QColorDialog(initial.isEmpty() ? QColor(40, 30, 20) : QColor(initial), host);
+            dialog->setAttribute(Qt::WA_DeleteOnClose);
+            dialog->setWindowTitle(tr("Pattern Colour"));
+            connect(dialog, &QColorDialog::currentColorChanged, dialog, [=](const QColor& color) {
+                if (document.isNull())
+                    return;
+                for (const auto& componentId : componentIds)
+                    document->setComponentWrapAttribute(componentId, "wrapPatternColor", color.name());
+            });
+            connect(dialog, &QColorDialog::rejected, dialog, [=]() {
+                if (document.isNull())
+                    return;
+                for (const auto& componentId : componentIds)
+                    document->setComponentWrapAttribute(componentId, "wrapPatternColor", initial);
+            });
+            connect(dialog, &QColorDialog::colorSelected, dialog, [=](const QColor& color) {
+                if (document.isNull())
+                    return;
+                for (const auto& componentId : componentIds)
+                    document->setComponentWrapAttribute(componentId, "wrapPatternColor", color.name());
+                document->saveSnapshot();
+            });
+            dialog->show();
+        });
+        QPushButton* patternColorAutoButton = new QPushButton(Theme::awesome()->icon(fa::eraser), "");
+        Theme::initIconButton(patternColorAutoButton);
+        patternColorAutoButton->setToolTip(tr("Automatic pattern colour"));
+        connect(patternColorAutoButton, &QPushButton::clicked, this, [=]() {
+            for (const auto& componentId : m_componentIds)
+                emit setComponentWrapAttribute(componentId, "wrapPatternColor", QString());
+            emit groupOperationAdded();
+            showPatternColor(QString());
+        });
+        QHBoxLayout* patternColorLayout = new QHBoxLayout;
+        patternColorLayout->addWidget(patternColorAutoButton);
+        patternColorLayout->addWidget(patternColorButton);
+        patternColorLayout->addStretch();
+        patternDetailsLayout->addLayout(patternColorLayout);
+
+        FloatNumberWidget* patternScaleWidget = new FloatNumberWidget;
+        patternScaleWidget->setItemName(tr("Pattern Size"));
+        patternScaleWidget->setRange(0.01f, 0.3f);
+        patternScaleWidget->setValue(floatValue("wrapPatternScale", 0.06f));
+        patternScaleWidget->setToolTip(tr("The size of one spot, rosette or stripe, in model units"));
+        connect(patternScaleWidget, &FloatNumberWidget::valueChanged, [=](float value) {
+            for (const auto& componentId : m_componentIds)
+                emit setComponentWrapAttribute(componentId, "wrapPatternScale", QString::number(value));
+            emit groupOperationAdded();
+        });
+        patternDetailsLayout->addWidget(patternScaleWidget);
+        patternDetailsWidget->setLayout(patternDetailsLayout);
+        patternDetailsWidget->setVisible(!patternValue.isEmpty());
+
+        FloatNumberWidget* bellyWidget = new FloatNumberWidget;
+        bellyWidget->setItemName(tr("Lighter Belly"));
+        bellyWidget->setRange(0.0f, 1.0f);
+        bellyWidget->setValue(floatValue("wrapBelly", 0.0f));
+        bellyWidget->setToolTip(tr("Countershading: how much lighter the underside is (the pattern fades there too)"));
+        connect(bellyWidget, &FloatNumberWidget::valueChanged, [=](float value) {
+            for (const auto& componentId : m_componentIds)
+                emit setComponentWrapAttribute(componentId, "wrapBelly", QString::number(value));
+            emit groupOperationAdded();
+        });
+
+        connect(patternComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [=](int index) {
+            QString value = patternComboBox->itemData(index).toString();
+            for (const auto& componentId : m_componentIds)
+                emit setComponentWrapAttribute(componentId, "wrapPattern", value);
+            emit groupOperationAdded();
+            patternDetailsWidget->setVisible(!value.isEmpty());
+        });
+        QHBoxLayout* patternLayout = new QHBoxLayout;
+        patternLayout->addWidget(patternComboBox);
+        patternLayout->addStretch();
+        wrapSettingsLayout->addLayout(patternLayout);
+        wrapSettingsLayout->addWidget(patternDetailsWidget);
+        wrapSettingsLayout->addWidget(bellyWidget);
+
+        // Folds in a normal map, placed from where the cloth rests on the body and where it hangs free
+        FloatNumberWidget* wrinklesWidget = new FloatNumberWidget;
+        wrinklesWidget->setItemName(tr("Wrinkles"));
+        wrinklesWidget->setRange(0.0f, 1.0f);
+        wrinklesWidget->setValue(floatValue("wrapWrinkles", 0.0f));
+        wrinklesWidget->setToolTip(tr("Folds baked into a normal map, where and the way the cloth folds on the body it is bound to (Weights From):\n"
+                                      "hanging from where it rests on the body (a skirt from the buttocks), sagging between two places it rests on\n"
+                                      "(between the thighs, under the bust), and bunched at the elbows, knees, cuffs and under a waistband"));
+        connect(wrinklesWidget, &FloatNumberWidget::valueChanged, [=](float value) {
+            for (const auto& componentId : m_componentIds)
+                emit setComponentWrapAttribute(componentId, "wrapWrinkles", QString::number(value));
+            emit groupOperationAdded();
+        });
+        wrapSettingsLayout->addWidget(wrinklesWidget);
+        FloatNumberWidget* wrinkleSizeWidget = new FloatNumberWidget;
+        wrinkleSizeWidget->setItemName(tr("Wrinkle Size"));
+        wrinkleSizeWidget->setRange(0.2f, 4.0f);
+        wrinkleSizeWidget->setValue(floatValue("wrapWrinkleSize", 1.0f));
+        wrinkleSizeWidget->setToolTip(tr("How wide the folds are: 1 is a natural fold width for the size of the figure"));
+        connect(wrinkleSizeWidget, &FloatNumberWidget::valueChanged, [=](float value) {
+            for (const auto& componentId : m_componentIds)
+                emit setComponentWrapAttribute(componentId, "wrapWrinkleSize", QString::number(value));
+            emit groupOperationAdded();
+        });
+        wrapSettingsLayout->addWidget(wrinkleSizeWidget);
+        wrapSettingsWidget->setLayout(wrapSettingsLayout);
+        wrapSettingsWidget->setVisible(!mode.isEmpty());
+
+        connect(wrapModeComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [=](int index) {
+            QString newMode = wrapModeComboBox->itemData(index).toString();
+            for (const auto& componentId : m_componentIds)
+                emit setComponentWrapAttribute(componentId, "wrap", newMode);
+            emit groupOperationAdded();
+            // the settings differ per mode: close the menu, it is rebuilt on the next open
+            QWidget* widget = this;
+            while (nullptr != widget) {
+                QMenu* menu = qobject_cast<QMenu*>(widget);
+                if (nullptr != menu) {
+                    menu->close();
+                    break;
+                }
+                widget = widget->parentWidget();
+            }
+        });
+
+        QHBoxLayout* wrapModeLayout = new QHBoxLayout;
+        wrapModeLayout->addWidget(wrapModeComboBox);
+        wrapModeLayout->addStretch();
+        QVBoxLayout* wrapLayout = new QVBoxLayout;
+        wrapLayout->addLayout(wrapModeLayout);
+        wrapLayout->addWidget(wrapSettingsWidget);
+        wrapGroupBox = new QGroupBox(tr("Wrap Modifier"));
+        wrapGroupBox->setLayout(wrapLayout);
+    }
+
     QGroupBox* importedModelGroupBox = nullptr;
     if (nullptr != m_part && dust3d::PartTarget::ImportedModel == m_part->target) {
         QPushButton* importGlbButton = new QPushButton(tr("Import GLB File..."));
@@ -659,11 +1053,17 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
         mainLayout->addWidget(cutFaceGroupBox);
     if (nullptr != smoothGroupBox)
         mainLayout->addWidget(smoothGroupBox);
+    if (nullptr != materialGroupBox)
+        mainLayout->addWidget(materialGroupBox);
+    if (nullptr != slotGroupBox)
+        mainLayout->addWidget(slotGroupBox);
     mainLayout->addLayout(skinLayout);
     if (nullptr != stitchingLineGroupBox)
         mainLayout->addWidget(stitchingLineGroupBox);
     if (nullptr != stitchingLoopGroupBox)
         mainLayout->addWidget(stitchingLoopGroupBox);
+    if (nullptr != wrapGroupBox)
+        mainLayout->addWidget(wrapGroupBox);
     mainLayout->setSizeConstraint(QLayout::SetFixedSize);
 
     connect(this, &ComponentPropertyWidget::setComponentColorState, m_document, &Document::setComponentColorState);
@@ -675,6 +1075,11 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
     connect(this, &ComponentPropertyWidget::setPartCutRotation, m_document, &Document::setPartCutRotation);
     connect(this, &ComponentPropertyWidget::setPartSubdivState, m_document, &Document::setPartSubdivState);
     connect(this, &ComponentPropertyWidget::setPartChamferState, m_document, &Document::setPartChamferState);
+    connect(this, &ComponentPropertyWidget::setPartHardState, m_document, &Document::setPartHardState);
+    connect(this, &ComponentPropertyWidget::setPartMetalness, m_document, &Document::setPartMetalness);
+    connect(this, &ComponentPropertyWidget::setPartRoughness, m_document, &Document::setPartRoughness);
+    connect(this, &ComponentPropertyWidget::setPartEmissive, m_document, &Document::setPartEmissive);
+    connect(this, &ComponentPropertyWidget::setPartInterpolatedState, m_document, &Document::setPartInterpolatedState);
     connect(this, &ComponentPropertyWidget::setPartRoundState, m_document, &Document::setPartRoundState);
     connect(this, &ComponentPropertyWidget::setComponentColorImage, m_document, &Document::setComponentColorImage);
     connect(this, &ComponentPropertyWidget::setComponentSideCloseState, m_document, &Document::setComponentSideCloseState);
@@ -690,6 +1095,7 @@ ComponentPropertyWidget::ComponentPropertyWidget(Document* document,
     connect(this, &ComponentPropertyWidget::setPartXmirrorState, m_document, &Document::setPartXmirrorState);
     connect(this, &ComponentPropertyWidget::setPartTarget, m_document, &Document::setPartTarget);
     connect(this, &ComponentPropertyWidget::setComponentCombineMode, m_document, &Document::setComponentCombineMode);
+    connect(this, &ComponentPropertyWidget::setComponentWrapAttribute, m_document, &Document::setComponentWrapAttribute);
     connect(this, &ComponentPropertyWidget::groupOperationAdded, m_document, &Document::saveSnapshot);
 
     setLayout(mainLayout);
@@ -873,6 +1279,30 @@ float ComponentPropertyWidget::lastBackCloseDepthRatio()
     return value;
 }
 
+bool ComponentPropertyWidget::hasGroupsOnly()
+{
+    for (const auto& componentId : m_componentIds) {
+        const Document::Component* component = m_document->findComponent(componentId);
+        if (nullptr == component || !component->linkToPartId.isNull())
+            return false;
+    }
+    return !m_componentIds.empty();
+}
+
+QString ComponentPropertyWidget::lastWrapAttribute(const std::string& name)
+{
+    for (auto it = m_componentIds.rbegin(); it != m_componentIds.rend(); ++it) {
+        const Document::Component* component = m_document->findComponent(*it);
+        if (nullptr == component)
+            continue;
+        auto found = component->wrap.find(name);
+        if (found != component->wrap.end())
+            return QString::fromStdString(found->second);
+        return QString();
+    }
+    return QString();
+}
+
 float ComponentPropertyWidget::lastBackCloseSharpness()
 {
     float value = 0.0f;
@@ -915,7 +1345,7 @@ float ComponentPropertyWidget::lastSmoothCutoffDegrees()
         const Document::Component* component = m_document->findComponent(componentId);
         if (nullptr == component)
             continue;
-        degreesMap[std::to_string(component->smoothCutoffDegrees)]++;
+        degreesMap[dust3d::String::fromDouble(component->smoothCutoffDegrees)]++;
     }
     if (!degreesMap.empty()) {
         smoothCutoffDegrees = dust3d::String::toFloat(std::max_element(degreesMap.begin(), degreesMap.end(),

@@ -20,6 +20,11 @@ signals:
     void setPartDeformUnified(const dust3d::Uuid& partId, bool unified);
     void setPartSubdivState(const dust3d::Uuid& partId, bool subdived);
     void setPartChamferState(const dust3d::Uuid& partId, bool chamfered);
+    void setPartHardState(const dust3d::Uuid& partId, bool hard);
+    void setPartMetalness(const dust3d::Uuid& partId, float metalness);
+    void setPartRoughness(const dust3d::Uuid& partId, float roughness);
+    void setPartEmissive(const dust3d::Uuid& partId, float emissive);
+    void setPartInterpolatedState(const dust3d::Uuid& partId, bool interpolated);
     void setPartRoundState(const dust3d::Uuid& partId, bool rounded);
     void setPartCutRotation(const dust3d::Uuid& partId, float cutRotation);
     void setComponentColorImage(const dust3d::Uuid& componentId, const dust3d::Uuid& imageId);
@@ -36,6 +41,7 @@ signals:
     void setPartXmirrorState(dust3d::Uuid partId, bool mirrored);
     void setPartTarget(const dust3d::Uuid& partId, dust3d::PartTarget target);
     void setComponentCombineMode(dust3d::Uuid componentId, dust3d::CombineMode combineMode);
+    void setComponentWrapAttribute(const dust3d::Uuid& componentId, const QString& name, const QString& value);
     void groupOperationAdded();
 
 public:
@@ -70,6 +76,8 @@ private:
 
     void updateCutFaceButtonState(size_t index);
     bool hasStitchingLineConfigure();
+    bool hasGroupsOnly();
+    QString lastWrapAttribute(const std::string& name);
     bool hasStitchingLoopConfigure();
 };
 

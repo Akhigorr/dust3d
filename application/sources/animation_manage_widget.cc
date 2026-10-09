@@ -5,6 +5,7 @@
 #include "theme.h"
 #include "toolbar_button.h"
 #include <QAudioFormat>
+#include <dust3d/animation/biped/clip_catalog.h>
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #include <QAudioSink>
 #else
@@ -15,6 +16,7 @@
 #include <QDebug>
 #include <QFile>
 #include <QFileDialog>
+#include <QFont>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -22,6 +24,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QListWidgetItem>
+#include <QPalette>
 #include <QScrollArea>
 #include <QVBoxLayout>
 #include <algorithm>
@@ -175,6 +178,7 @@ void AnimationManageWidget::createParameterWidgets()
     m_parameterLayout = parameterLayout;
     parameterLayout->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
     parameterLayout->setFormAlignment(Qt::AlignLeft | Qt::AlignTop);
+    parameterLayout->setRowWrapPolicy(QFormLayout::WrapLongRows);
     parameterLayout->setContentsMargins(0, 0, 0, 0);
     parameterLayout->setSpacing(6);
 
@@ -247,7 +251,9 @@ void AnimationManageWidget::createParameterWidgets()
                     double durationSeconds = m_sharedDurationSpinBox ? m_sharedDurationSpinBox->value() : 1.0;
                     int frameCount = (int)m_animationFrames.size();
                     if (frameCount > 0 && durationSeconds > 0.0) {
-                        float timeAtFrame = (float)(durationSeconds * value / frameCount);
+                        float timeAtFrame = value < (int)m_animationFrameTimes.size()
+                            ? m_animationFrameTimes[value]
+                            : (float)(durationSeconds * value / frameCount);
                         m_groundOffsetX = m_movementDirectionX * m_movementSpeed * timeAtFrame;
                         m_groundOffsetZ = m_movementDirectionZ * m_movementSpeed * timeAtFrame;
                         m_modelWidget->setGroundOffset(m_groundOffsetX, m_groundOffsetZ);
@@ -311,10 +317,39 @@ void AnimationManageWidget::rebuildDynamicControls(const QString& animationType)
         slider->setSingleStep(1);
         slider->setFocusPolicy(Qt::NoFocus);
 
+        // Long display names such as "Fall Direction (-1 Back, 0 Side, 1 Front)"
+        // would stretch the label column and squash every slider, so keep the
+        // label short and show the parenthesized hint under the slider instead.
+        QString fullName = QString::fromStdString(def.displayName);
+        QString labelText = fullName;
+        QString hintText;
+        int hintStart = fullName.indexOf(QStringLiteral(" ("));
+        if (hintStart > 0 && fullName.endsWith(')')) {
+            labelText = fullName.left(hintStart);
+            hintText = fullName.mid(hintStart + 2, fullName.size() - hintStart - 3);
+        }
+
         QWidget* rowWidget = new QWidget;
-        QHBoxLayout* rowLayout = new QHBoxLayout(rowWidget);
+        QVBoxLayout* rowOuterLayout = new QVBoxLayout(rowWidget);
+        rowOuterLayout->setContentsMargins(0, 0, 0, 0);
+        rowOuterLayout->setSpacing(0);
+        QWidget* sliderRow = new QWidget;
+        QHBoxLayout* rowLayout = new QHBoxLayout(sliderRow);
         rowLayout->setContentsMargins(0, 0, 0, 0);
         rowLayout->addWidget(slider);
+        rowOuterLayout->addWidget(sliderRow);
+        if (!hintText.isEmpty()) {
+            QLabel* hintLabel = new QLabel(hintText);
+            hintLabel->setWordWrap(true);
+            QFont hintFont = hintLabel->font();
+            hintFont.setPointSizeF(hintFont.pointSizeF() * 0.85);
+            hintLabel->setFont(hintFont);
+            QPalette hintPalette = hintLabel->palette();
+            hintPalette.setColor(QPalette::WindowText, hintPalette.color(QPalette::Disabled, QPalette::WindowText));
+            hintLabel->setPalette(hintPalette);
+            rowOuterLayout->addWidget(hintLabel);
+        }
+        slider->setToolTip(fullName);
 
         QLabel* valueLabel = new QLabel;
         valueLabel->setFixedWidth(36);
@@ -323,7 +358,8 @@ void AnimationManageWidget::rebuildDynamicControls(const QString& animationType)
             valueLabel->setText(QString::number(def.toParam(def.defaultSliderValue), 'f', 2));
         rowLayout->addWidget(valueLabel);
 
-        QLabel* label = new QLabel(QString::fromStdString(def.displayName));
+        QLabel* label = new QLabel(labelText);
+        label->setToolTip(fullName);
         m_parameterLayout->addRow(label, rowWidget);
 
         DynamicParameterControl ctrl;
@@ -366,7 +402,7 @@ void AnimationManageWidget::displayCurrentFrame()
             m_modelWidget->updateWireframeMesh(nullptr);
         }
     }
-    m_modelWidget->updateMesh(new ModelMesh(frameSource));
+    m_modelWidget->updateMeshGeometry(new ModelMesh(frameSource));
 
     if (m_animationFrameSlider && !m_isScrubbing) {
         m_animationFrameSlider->blockSignals(true);
@@ -381,75 +417,15 @@ void AnimationManageWidget::updateAnimationNameForRigType(const QString& rigType
         return;
 
     m_animationNameCombo->clear();
-    if (rigType.compare("Insect", Qt::CaseInsensitive) == 0) {
-        m_animationNameCombo->addItem("InsectAttack");
-        m_animationNameCombo->addItem("InsectDie");
-        m_animationNameCombo->addItem("InsectFly");
-        m_animationNameCombo->addItem("InsectIdle");
-        m_animationNameCombo->addItem("InsectRubHands");
-        m_animationNameCombo->addItem("InsectWalk");
-        m_animationNameCombo->setEnabled(true);
-        m_addAnimationButton->setEnabled(true);
-    } else if (rigType.compare("Bird", Qt::CaseInsensitive) == 0) {
-        m_animationNameCombo->addItem("BirdAttack");
-        m_animationNameCombo->addItem("BirdDie");
-        m_animationNameCombo->addItem("BirdEat");
-        m_animationNameCombo->addItem("BirdFly");
-        m_animationNameCombo->addItem("BirdGlide");
-        m_animationNameCombo->addItem("BirdIdle");
-        m_animationNameCombo->addItem("BirdRun");
-        m_animationNameCombo->addItem("BirdWalk");
-        m_animationNameCombo->setEnabled(true);
-        m_addAnimationButton->setEnabled(true);
-    } else if (rigType.compare("Fish", Qt::CaseInsensitive) == 0) {
-        m_animationNameCombo->addItem("FishDie");
-        m_animationNameCombo->addItem("FishIdle");
-        m_animationNameCombo->addItem("FishSwim");
-        m_animationNameCombo->setEnabled(true);
-        m_addAnimationButton->setEnabled(true);
-    } else if (rigType.compare("Biped", Qt::CaseInsensitive) == 0) {
-        m_animationNameCombo->addItem("BipedCast");
-        m_animationNameCombo->addItem("BipedChannel");
-        m_animationNameCombo->addItem("BipedDie");
-        m_animationNameCombo->addItem("BipedHurt");
-        m_animationNameCombo->addItem("BipedIdle");
-        m_animationNameCombo->addItem("BipedJump");
-        m_animationNameCombo->addItem("BipedRoar");
-        m_animationNameCombo->addItem("BipedRun");
-        m_animationNameCombo->addItem("BipedSlam");
-        m_animationNameCombo->addItem("BipedStab");
-        m_animationNameCombo->addItem("BipedWalk");
-        m_animationNameCombo->setEnabled(true);
-        m_addAnimationButton->setEnabled(true);
-    } else if (rigType.compare("Quadruped", Qt::CaseInsensitive) == 0) {
-        m_animationNameCombo->addItem("QuadrupedAttack");
-        m_animationNameCombo->addItem("QuadrupedDie");
-        m_animationNameCombo->addItem("QuadrupedEat");
-        m_animationNameCombo->addItem("QuadrupedHurt");
-        m_animationNameCombo->addItem("QuadrupedIdle");
-        m_animationNameCombo->addItem("QuadrupedRoar");
-        m_animationNameCombo->addItem("QuadrupedRun");
-        m_animationNameCombo->addItem("QuadrupedWalk");
-        m_animationNameCombo->setEnabled(true);
-        m_addAnimationButton->setEnabled(true);
-    } else if (rigType.compare("Spider", Qt::CaseInsensitive) == 0) {
-        m_animationNameCombo->addItem("SpiderDie");
-        m_animationNameCombo->addItem("SpiderIdle");
-        m_animationNameCombo->addItem("SpiderRun");
-        m_animationNameCombo->addItem("SpiderWalk");
-        m_animationNameCombo->setEnabled(true);
-        m_addAnimationButton->setEnabled(true);
-    } else if (rigType.compare("Snake", Qt::CaseInsensitive) == 0) {
-        m_animationNameCombo->addItem("SnakeDie");
-        m_animationNameCombo->addItem("SnakeIdle");
-        m_animationNameCombo->addItem("SnakeSlither");
-        m_animationNameCombo->setEnabled(true);
-        m_addAnimationButton->setEnabled(true);
-    } else {
-        m_animationNameCombo->addItem("N/A");
-        m_animationNameCombo->setEnabled(false);
-        m_addAnimationButton->setEnabled(false);
+    for (const auto& clip : dust3d::animation::clipCatalog()) {
+        if (!clip.second.alias && rigType.compare(QString::fromStdString(clip.second.rig), Qt::CaseInsensitive) == 0)
+            m_animationNameCombo->addItem(QString::fromStdString(clip.first));
     }
+    const bool available = m_animationNameCombo->count() > 0;
+    if (!available)
+        m_animationNameCombo->addItem("N/A");
+    m_animationNameCombo->setEnabled(available);
+    m_addAnimationButton->setEnabled(available);
 }
 
 void AnimationManageWidget::onRigTypeChanged(const QString& rigType)
@@ -489,6 +465,7 @@ void AnimationManageWidget::triggerPreviewRegeneration()
 
 AnimationManageWidget::~AnimationManageWidget()
 {
+    m_backgroundTasks.waitForDone();
     stopSoundPlayback();
     stopAnimationLoop();
 }
@@ -574,8 +551,8 @@ void AnimationManageWidget::onResultRigChanged()
     m_animationWorker->setParameters(actualRig, animationType.toStdString(), m_animationParams);
     m_animationWorker->setHideBones(m_hideBonesCheck ? !m_hideBonesCheck->isChecked() : true);
     m_animationWorker->setHideParts(m_hidePartsCheck ? !m_hidePartsCheck->isChecked() : true);
-    m_animationWorker->setSelectedBoneName(
-        (m_hideWeightsCheck && !m_hideWeightsCheck->isChecked()) ? QString() : m_selectedBoneName);
+    QString weightsBoneName = (m_hideWeightsCheck && !m_hideWeightsCheck->isChecked()) ? QString() : m_selectedBoneName;
+    m_animationWorker->setSelectedBoneName(weightsBoneName);
 
     // Sound settings
     bool soundEnabled = m_playSoundCheck && m_playSoundCheck->isChecked();
@@ -586,18 +563,26 @@ void AnimationManageWidget::onResultRigChanged()
     }
 
     dust3d::Object* rigObject = m_document->takeRigObject();
+
+    // The maps of the model (color, normal, material), shown as they are exported. Not when
+    // the weights are shown, these are vertex colors, and not when the maps belong to a
+    // different mesh than the rig, that is, when the rig is not regenerated yet.
+    m_pendingMapsMesh.reset();
+    if (nullptr != rigObject && weightsBoneName.isEmpty() && m_document->resultTextureMeshId() == rigObject->meshId)
+        m_pendingMapsMesh.reset(m_document->takeResultTextureMesh());
     m_animationWorker->setRigObject(std::unique_ptr<dust3d::Object>(rigObject));
     if (m_document->textureImage)
         m_animationWorker->setTextureImage(std::make_unique<QImage>(*m_document->textureImage));
 
     auto thread = new QThread;
+    m_backgroundTasks.add(thread);
     m_animationWorker->moveToThread(thread);
 
     m_animationWorkerBusy = true;
 
     connect(thread, &QThread::started, m_animationWorker.get(), &AnimationPreviewWorker::process);
-    connect(m_animationWorker.get(), &AnimationPreviewWorker::finished, this, &AnimationManageWidget::onAnimationPreviewReady);
-    connect(m_animationWorker.get(), &AnimationPreviewWorker::finished, thread, &QThread::quit);
+    connect(thread, &QThread::finished, this, &AnimationManageWidget::onAnimationPreviewReady);
+    connect(m_animationWorker.get(), &AnimationPreviewWorker::finished, thread, &QThread::quit, Qt::DirectConnection);
     connect(thread, &QThread::finished, thread, &QThread::deleteLater);
 
     thread->start();
@@ -611,6 +596,8 @@ void AnimationManageWidget::onAnimationPreviewReady()
         qWarning() << "AnimationManageWidget: preview worker finished but missing worker";
     } else {
         m_animationFrames = m_animationWorker->takePreviewMeshes();
+        m_animationFrameTimes = m_animationWorker->takeFrameTimes();
+        m_animationFrameInterval = m_animationWorker->frameInterval();
         m_soundData = m_animationWorker->takeSoundData();
         m_movementSpeed = m_animationWorker->movementSpeed();
         m_movementDirectionX = m_animationWorker->movementDirectionX();
@@ -650,6 +637,11 @@ void AnimationManageWidget::onAnimationPreviewReady()
     if (m_playPauseButton)
         m_playPauseButton->setEnabled(true);
 
+    // All the frames share the same maps, upload them once
+    if (m_modelWidget)
+        m_modelWidget->updateMaps(m_pendingMapsMesh.get());
+    m_pendingMapsMesh.reset();
+
     m_currentFrame = 0;
     displayCurrentFrame();
 
@@ -669,12 +661,16 @@ void AnimationManageWidget::onAnimationFrameTimeout()
     if (m_animationFrames.empty() || !m_modelWidget)
         return;
 
+    m_currentFrame = (m_currentFrame + 1) % (int)m_animationFrames.size();
+
     // Accumulate ground offset in the inverse direction of movement
     if (m_movementSpeed > 0.0f && !m_animationFrames.empty()) {
         double durationSeconds = m_sharedDurationSpinBox ? m_sharedDurationSpinBox->value() : 1.0;
         int frameCount = (int)m_animationFrames.size();
         if (frameCount > 0 && durationSeconds > 0.0) {
-            float dt = (float)(durationSeconds / frameCount);
+            float dt = m_animationFrameInterval > 0.0f
+                ? m_animationFrameInterval
+                : (float)(durationSeconds / frameCount);
             m_groundOffsetX += m_movementDirectionX * m_movementSpeed * dt;
             m_groundOffsetZ += m_movementDirectionZ * m_movementSpeed * dt;
         }
@@ -682,8 +678,6 @@ void AnimationManageWidget::onAnimationFrameTimeout()
     }
 
     displayCurrentFrame();
-
-    m_currentFrame = (m_currentFrame + 1) % (int)m_animationFrames.size();
 }
 
 void AnimationManageWidget::startAnimationLoop()
@@ -695,7 +689,10 @@ void AnimationManageWidget::startAnimationLoop()
     int frameCount = m_sharedFrameCountSpinBox ? m_sharedFrameCountSpinBox->value() : 30;
     if (frameCount < 1)
         frameCount = 1;
-    int intervalMs = std::max(1, static_cast<int>((durationSeconds * 1000.0) / frameCount));
+    double interval = m_animationFrameInterval > 0.0f
+        ? m_animationFrameInterval
+        : durationSeconds / frameCount;
+    int intervalMs = std::max(1, static_cast<int>(interval * 1000.0));
     m_frameTimer->setInterval(intervalMs);
 
     if (!m_frameTimer->isActive()) {
@@ -841,6 +838,17 @@ void AnimationManageWidget::onAddAnimationClicked()
     m_parametersGroupBox->show();
     m_bottomStretch->hide();
     rebuildDynamicControls(type);
+    const auto timing = dust3d::AnimationGenerator::defaultTiming(type.toStdString());
+    if (m_sharedDurationSpinBox) {
+        m_sharedDurationSpinBox->blockSignals(true);
+        m_sharedDurationSpinBox->setValue(timing.first);
+        m_sharedDurationSpinBox->blockSignals(false);
+    }
+    if (m_sharedFrameCountSpinBox) {
+        m_sharedFrameCountSpinBox->blockSignals(true);
+        m_sharedFrameCountSpinBox->setValue(timing.second);
+        m_sharedFrameCountSpinBox->blockSignals(false);
+    }
 
     autoSaveCurrentAnimation();
 
@@ -979,12 +987,12 @@ void AnimationManageWidget::loadAnimationIntoForm(const dust3d::Uuid& animationI
     // Load common parameters
     if (m_sharedDurationSpinBox) {
         m_sharedDurationSpinBox->blockSignals(true);
-        m_sharedDurationSpinBox->setValue(params.getValue("durationSeconds", 3.0));
+        m_sharedDurationSpinBox->setValue(params.getValue("durationSeconds", dust3d::AnimationGenerator::defaultTiming(anim->type.toStdString()).first));
         m_sharedDurationSpinBox->blockSignals(false);
     }
     if (m_sharedFrameCountSpinBox) {
         m_sharedFrameCountSpinBox->blockSignals(true);
-        m_sharedFrameCountSpinBox->setValue(static_cast<int>(params.getValue("frameCount", 90.0)));
+        m_sharedFrameCountSpinBox->setValue(static_cast<int>(params.getValue("frameCount", dust3d::AnimationGenerator::defaultTiming(anim->type.toStdString()).second)));
         m_sharedFrameCountSpinBox->blockSignals(false);
     }
 

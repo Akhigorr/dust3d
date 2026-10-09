@@ -26,6 +26,7 @@
 
 #include <cmath>
 #include <dust3d/animation/animation_generator.h>
+#include <dust3d/animation/biped/pose.h>
 #include <dust3d/animation/biped/slam.h>
 #include <dust3d/animation/common.h>
 #include <dust3d/base/math.h>
@@ -66,7 +67,15 @@ namespace biped {
                 double p = (t - onset) / (peak - onset);
                 return p * p * p;
             }
-            return std::exp(-(t - peak) * decay);
+            // The tail of the burst fades out completely by the end of the clip, so the clip
+            // ends at the rest pose without a separate counter-motion.
+            double fadeX = (t - 0.6) / 0.4;
+            double fade = fadeX <= 0.0 ? 1.0 : (fadeX >= 1.0 ? 0.0 : 1.0 - fadeX * fadeX * fadeX * (fadeX * (fadeX * 6.0 - 15.0) + 10.0));
+            return std::exp(-(t - peak) * decay) * fade;
+        };
+        // Turn unit vector a toward unit vector b by the fraction w (0 = a, 1 = b).
+        auto turnToward = [](const Vector3& a, const Vector3& b, double w, Quaternion* history) -> Vector3 {
+            return animation::turnAbout(Vector3(), a, b, w, history).transformVector(a).normalized();
         };
         auto tremble = [](double tRad, double seed, double intensity) -> double {
             return intensity * (0.4 * std::sin(tRad * 11.0 + seed * 3.7) + 0.25 * std::sin(tRad * 17.0 + seed * 5.3) + 0.2 * std::sin(tRad * 23.0 + seed * 7.1) + 0.15 * std::sin(tRad * 31.0 + seed * 11.3));
@@ -145,7 +154,7 @@ namespace biped {
             hairSim.initialize(rigStructure, boneIdx, hairBoneNames,
                 animation::buildBoneWorldTransform(bonePos("Head"), boneEnd("Head")),
                 0.08, 0.87, 1.0);
-        double hairDt = durationSeconds / std::max(1, frameCount);
+        double hairDt = durationSeconds / std::max(1, frameCount - 1);
 
         animation::CapeGridSimulator capeSim;
         if (boneIdx.count("CenterCape1"))
@@ -154,8 +163,9 @@ namespace biped {
                 0.08, 0.85, 1.2, 0.15);
 
         for (int pass = 0; pass < 2; ++pass) {
+            std::map<std::string, Quaternion> windupHistory, strikeHistory;
             for (int frame = 0; frame < frameCount; ++frame) {
-                double t = static_cast<double>(frame) / static_cast<double>(frameCount);
+                double t = static_cast<double>(frame) / static_cast<double>(frameCount - 1);
                 std::map<std::string, Matrix4x4> boneWorldTransforms;
 
                 // Pre-anticipation: before arms rise the body dips slightly forward and down.
@@ -181,7 +191,6 @@ namespace biped {
                     + strikeBurst * 0.42 * slamForceFactor * spineFoldFactor
                     + hitStopVal * 0.36 * slamForceFactor * spineFoldFactor
                     + followThru * 0.14 * recoverySpeedFactor
-                    - recover * 0.50
                     + impactRing;
 
                 // Body: anticipation dip → rise during windup → crash on strike.
@@ -191,8 +200,7 @@ namespace biped {
                     + windupRaise * legLen * 0.04 * windupHeightFactor
                     - strikeBurst * legLen * 0.12 * crouchDepthFactor
                     - hitStopVal * legLen * 0.10 * crouchDepthFactor
-                    - followThru * legLen * 0.06 * crouchDepthFactor
-                    + recover * legLen * 0.08;
+                    - followThru * legLen * 0.06 * crouchDepthFactor;
                 double forwardLean = anticipate * legLen * 0.012 // lean into the load
                     + strikeBurst * legLen * 0.07 * slamForceFactor / massInertia;
 
@@ -223,22 +231,15 @@ namespace biped {
                             r.rotate(right, extraPitch);
                         boneDir = r.transformVector(boneDir);
                     }
-                    // Start: parent's animated end + the rest-pose gap DISTANCE offset
-                    // along boneDir. This keeps |parent-end to child-begin| equal to the
-                    // rest-pose distance without locking the gap direction, so the child
-                    // always continues naturally from the parent with no mesh shrinkage.
+                    // Carry the full bind offset with the parent's transform. Fitted
+                    // modular rigs may have sideways or overlapping joint offsets;
+                    // replacing that vector by its length along boneDir permanently
+                    // lifts the torso, even at the clip's neutral endpoints.
                     Vector3 newPos;
                     if (!parentName.empty() && boneChainEnd.count(parentName) > 0) {
-                        double gapDist = (pos - boneEnd(parentName)).length();
-                        if (gapDist > 1e-8) {
-                            double boneDirLen = boneDir.length();
-                            Vector3 gapOffset = (boneDirLen > 1e-8)
-                                ? boneDir * (gapDist / boneDirLen)
-                                : Vector3();
-                            newPos = boneChainEnd[parentName] + gapOffset;
-                        } else {
-                            newPos = boneChainEnd[parentName];
-                        }
+                        newPos = carryWithBone(
+                            buildBoneWorldTransform(bonePos(parentName), boneEnd(parentName)),
+                            boneWorldTransforms[parentName], pos);
                     } else {
                         newPos = bodyTransform.transformPoint(pos);
                     }
@@ -285,27 +286,11 @@ namespace biped {
                         hasPrev = true;
                     }
                 }
+                // Legs stay planted (lifted by `lift` for a stomp): two-bone IK to the rest ankle, the knee
+                // keeps its rest bend and the foot stays flat, so the legs are exactly at rest when the
+                // body is.
                 auto computeLeg = [&](const char* ul, const char* ll, const char* f, double lift) {
-                    Vector3 footStart = bonePos(f) + upDir * lift;
-                    Vector3 footVec = boneEnd(f) - bonePos(f); // rest-pose foot direction+length
-                    Vector3 hipJoint = bodyTransform.transformPoint(bonePos(ul));
-                    double upperLen = (boneEnd(ul) - bonePos(ul)).length();
-                    double lowerLen = (boneEnd(ll) - bonePos(ll)).length();
-                    Vector3 midBind = bodyTransform.transformPoint(bonePos(ll));
-                    Vector3 poleTarget = midBind + forward * (upperLen * 0.5);
-                    // Init joints with rest-pose lengths so IK never stretches bones
-                    Vector3 hipToKnee = midBind - hipJoint;
-                    double hkLen = hipToKnee.length();
-                    Vector3 kneeInit = (hkLen > 1e-6) ? hipJoint + hipToKnee * (upperLen / hkLen) : hipJoint + upDir * (-upperLen);
-                    Vector3 kneeToFoot = footStart - kneeInit;
-                    double kfLen = kneeToFoot.length();
-                    Vector3 ankleInit = (kfLen > 1e-6) ? kneeInit + kneeToFoot * (lowerLen / kfLen) : kneeInit + upDir * (-lowerLen);
-                    std::vector<Vector3> joints = { hipJoint, kneeInit, ankleInit };
-                    solveTwoBoneIk(joints, footStart, poleTarget, 0.05);
-                    boneWorldTransforms[ul] = buildBoneWorldTransform(joints[0], joints[1]);
-                    boneWorldTransforms[ll] = buildBoneWorldTransform(joints[1], joints[2]);
-                    // Foot starts at IK-solved ankle so there is no gap with the lower leg
-                    boneWorldTransforms[f] = buildBoneWorldTransform(joints[2], joints[2] + footVec);
+                    posePlantedLeg(rigStructure, boneIdx, ul, ll, f, bodyTransform, upDir * lift, boneWorldTransforms);
                 };
                 computeLeg("LeftUpperLeg", "LeftLowerLeg", "LeftFoot", 0.0);
                 computeLeg("RightUpperLeg", "RightLowerLeg", "RightFoot", 0.0);
@@ -324,7 +309,7 @@ namespace biped {
                     // Shoulder start: chest's FK-propagated end so the arm chain
                     // is physically connected to the spine (no gap under spine rotation).
                     Vector3 shPos = boneChainEnd.count("Chest") > 0
-                        ? boneChainEnd["Chest"]
+                        ? carryWithBone(buildBoneWorldTransform(bonePos("Chest"), boneEnd("Chest")), boneWorldTransforms["Chest"], bonePos(shoulder))
                         : bodyTransform.transformPoint(bonePos(shoulder));
                     Vector3 shEnd = shPos + bodyTransform.transformVector(boneEnd(shoulder) - bonePos(shoulder));
                     {
@@ -336,43 +321,81 @@ namespace biped {
                     boneWorldTransforms[shoulder] = buildBoneWorldTransform(shPos, shEnd);
 
                     Vector3 upperStart = shEnd;
-                    Vector3 upperDir = bodyTransform.transformVector(boneEnd(upper) - bonePos(upper));
+                    const std::string prefix = isLeft ? "Left" : "Right";
+                    Matrix4x4 neutralUpper = relaxedArm(rigStructure, boneIdx, upper, parameters);
+                    Matrix4x4 neutralLower = relaxedForearm(rigStructure, boneIdx, prefix, parameters);
+                    Vector3 upperDir = bodyTransform.transformVector(neutralUpper.transformVector(boneEnd(upper) - bonePos(upper)));
 
-                    // Arms pitch to OVERHEAD (-1.55 rad) in windup, slam DOWN (+1.70 rad) at strike
+                    // The upper arm swings from its rest direction to OVERHEAD in the windup, then
+                    // down to FORWARD-AND-DOWN on the strike, held through the hit-stop, and back.
+                    // Targets are directions, not angles from the rest pose, so the same clip works
+                    // for arms that hang down (A-pose) and arms held out (T-pose).
                     double upperWindup = asymEnvelope(t - delay, 0.0, 0.14, 0.32) * windupHeightFactor * armSpreadFactor;
                     double upperStrike = explosiveEnvelope(t - delay, 0.28, 0.38, 5.0 / massInertia) * slamForceFactor;
-                    double upperPitch = upperWindup * (-1.55)
-                        + upperStrike * 1.70
-                        + hitStopVal * 1.55 * slamForceFactor
-                        + followThru * 0.14
-                        - recover * 1.60;
+                    double strikeHold = std::min(1.0, upperStrike + hitStopVal * slamForceFactor + followThru * 0.3);
+                    double restLen = upperDir.length();
+                    Vector3 restDirN = restLen > 1e-9 ? upperDir * (1.0 / restLen) : -upDir;
+                    // Anatomical side must come from the bind shoulder position: a
+                    // nearly vertical arm changes lateral direction as the torso rocks.
+                    Vector3 outward = right * (Vector3::dotProduct(bonePos(upper) - bonePos("Chest"), right) >= 0.0 ? 1.0 : -1.0);
+                    Vector3 overheadDir = (upDir + forward * 0.25 + outward * 0.12).normalized();
+                    Vector3 strikeDir = (forward * 0.8 - upDir * 0.55 + outward * 0.08).normalized();
+                    // Hold overhead from the top of the windup until the strike has taken over,
+                    // so the arms never drop back to rest between the two.
+                    double overheadWeight = std::min(1.0, upperWindup);
+                    if (t - delay >= 0.14)
+                        overheadWeight = std::max(overheadWeight,
+                            std::min(1.0, windupHeightFactor * armSpreadFactor) * (1.0 - smoothstep(((t - delay) - 0.36) / 0.1)));
+                    Vector3 armDir = turnToward(restDirN, overheadDir, overheadWeight, &windupHistory[upper]);
+                    armDir = turnToward(armDir, strikeDir, strikeHold, &strikeHistory[upper]);
                     double upperYaw = windupRaise * sideSign * 0.14 - strikeBurst * sideSign * 0.08;
                     Matrix4x4 r1;
-                    r1.rotate(right, upperPitch);
                     r1.rotate(upDir, upperYaw);
+                    r1.rotate(Quaternion::rotationTo(restDirN, armDir));
+                    // The shortest swing loses its twist reference when the arm is
+                    // raised opposite its bind direction. Keep the elbow plane facing
+                    // the torso's forward axis so the forearm cannot orbit the arm.
+                    Vector3 bindDir = neutralUpper.transformVector(boneEnd(upper) - bonePos(upper)).normalized();
+                    Vector3 pole = bodyTransform.transformVector(
+                        std::abs(Vector3::dotProduct(forward, bindDir)) > 0.9 ? right : forward);
+                    Vector3 sourcePole = pole - restDirN * Vector3::dotProduct(pole, restDirN);
+                    Vector3 targetDir = r1.transformVector(restDirN).normalized();
+                    Vector3 desiredPole = pole - targetDir * Vector3::dotProduct(pole, targetDir);
+                    Vector3 carriedPole = r1.transformVector(sourcePole).normalized();
+                    if (desiredPole.lengthSquared() > 1e-10 && sourcePole.lengthSquared() > 1e-10) {
+                        desiredPole.normalize();
+                        double roll = std::atan2(Vector3::dotProduct(targetDir, Vector3::crossProduct(carriedPole, desiredPole)),
+                            Vector3::dotProduct(carriedPole, desiredPole));
+                        Matrix4x4 stabilize;
+                        stabilize.rotate(targetDir, roll);
+                        stabilize *= r1;
+                        r1 = stabilize;
+                    }
                     Vector3 upperEnd = upperStart + r1.transformVector(upperDir);
                     boneWorldTransforms[upper] = buildBoneWorldTransform(upperStart, upperEnd);
 
-                    // Forearm: slight bend at overhead, extends on strike
-                    Vector3 lowerDir = bodyTransform.transformVector(boneEnd(lower) - bonePos(lower));
+                    // Forearm: follows the upper arm, slight bend overhead, extends on the strike.
+                    Vector3 lowerDir = bodyTransform.transformVector(neutralLower.transformVector(boneEnd(lower) - bonePos(lower)));
                     double forearmBurst = explosiveEnvelope(t - delay - 0.02, 0.28, 0.38, 5.0 / massInertia) * slamForceFactor;
-                    double elbowBend = windupRaise * 0.16 * windupHeightFactor - forearmBurst * 0.10 + recover * 0.18;
+                    double elbowBend = windupRaise * 0.35 * windupHeightFactor - forearmBurst * 0.10;
                     Matrix4x4 r2;
-                    r2.rotate(right, upperPitch * 0.55 + elbowBend);
+                    r2.rotate(right, -elbowBend);
+                    r2 *= r1;
                     Vector3 lowerEnd = upperEnd + r2.transformVector(lowerDir);
                     boneWorldTransforms[lower] = buildBoneWorldTransform(upperEnd, lowerEnd);
 
                     // Hand: wrist crack at impact.
                     // Tremble during hit-stop: micro-noise while the muscles hold against the impulse.
-                    Vector3 handDir = bodyTransform.transformVector(boneEnd(hand) - bonePos(hand));
+                    Vector3 handDir = bodyTransform.transformVector(neutralLower.transformVector(boneEnd(hand) - bonePos(hand)));
                     double handBurst = explosiveEnvelope(t - delay - 0.04, 0.28, 0.38, 6.0 / massInertia) * slamForceFactor;
                     double tRad = t * Math::Pi * 2.0 * 22.0;
                     double armTremble = tremble(tRad, isLeft ? 1.7 : 2.3, hitStopVal * 0.016 * slamForceFactor);
                     // Wrist also rings at impact — overshoots forward then settles
                     double wristRing = dampedRing(t - delay, 0.38, 14.0, 18.0) * 0.05 * slamForceFactor;
-                    double wristSnap = handBurst * 0.24 * slamForceFactor - recover * 0.22 + armTremble + wristRing;
+                    double wristSnap = handBurst * 0.24 * slamForceFactor + armTremble + wristRing;
                     Matrix4x4 r3;
-                    r3.rotate(right, upperPitch * 0.35 + wristSnap);
+                    r3.rotate(right, wristSnap);
+                    r3 *= r2;
                     Vector3 handEnd = lowerEnd + r3.transformVector(handDir);
                     boneWorldTransforms[hand] = buildBoneWorldTransform(lowerEnd, handEnd);
                 }
@@ -400,6 +423,9 @@ namespace biped {
                 }
             }
         } // end pass
+        // Both hands come down together; the left trails by its swing delay.
+        animationClip.events.push_back({ "hit", static_cast<float>(0.38 * durationSeconds), "RightHand" });
+        animationClip.events.push_back({ "hit", static_cast<float>((0.38 + 0.025) * durationSeconds), "LeftHand" });
         return true;
     }
 

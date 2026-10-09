@@ -35,6 +35,7 @@
 //   - abdomenPulseFactor:   abdomen expansion/contraction
 //   - bodySwayFactor:       subtle lateral body sway
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <dust3d/animation/animation_generator.h>
@@ -84,7 +85,8 @@ namespace spider {
             return false;
 
         double breathingAmplitudeFactor = parameters.getValue("breathingAmplitudeFactor", 1.0);
-        double breathingSpeedFactor = parameters.getValue("breathingSpeedFactor", 1.0);
+        // Whole cycles per clip, so the loop has no seam.
+        double breathingSpeedFactor = std::max(1.0, std::round(parameters.getValue("breathingSpeedFactor", 1.0)));
         double pedipalpSwayFactor = parameters.getValue("pedipalpSwayFactor", 1.0);
         double legTwitchFactor = parameters.getValue("legTwitchFactor", 1.0);
         double abdomenPulseFactor = parameters.getValue("abdomenPulseFactor", 1.0);
@@ -168,7 +170,7 @@ namespace spider {
 
             double breathPhase = tNormalized * 2.0 * Math::Pi * breathingSpeedFactor;
             double breathOffset = breathAmp * std::sin(breathPhase);
-            double lateralSway = swayAmp * std::sin(tNormalized * 2.0 * Math::Pi * 0.4);
+            double lateralSway = swayAmp * std::sin(tNormalized * 2.0 * Math::Pi * 1.0);
 
             Matrix4x4 bodyTransform;
             bodyTransform.translate(upDir * breathOffset + right * lateralSway);
@@ -196,7 +198,7 @@ namespace spider {
 
             computeBone("Root");
             computeBone("Cephalothorax");
-            computeBone("Head", 0.02 * std::sin(tNormalized * 2.0 * Math::Pi * 0.8));
+            computeBone("Head", 0.02 * std::sin(tNormalized * 2.0 * Math::Pi * 2.0));
 
             // Abdomen pulse
             double abdomenPulse = 0.015 * abdomenPulseFactor * std::sin(breathPhase);
@@ -204,17 +206,17 @@ namespace spider {
 
             // Pedipalps
             if (boneIdx.count("LeftPedipalp")) {
-                double palpAngle = 0.05 * pedipalpSwayFactor * std::sin(tNormalized * 2.0 * Math::Pi * 1.2);
+                double palpAngle = 0.05 * pedipalpSwayFactor * std::sin(tNormalized * 2.0 * Math::Pi * 1.0);
                 computeBone("LeftPedipalp", palpAngle, palpAngle * 0.3);
             }
             if (boneIdx.count("RightPedipalp")) {
-                double palpAngle = 0.05 * pedipalpSwayFactor * std::sin(tNormalized * 2.0 * Math::Pi * 1.2 + 1.0);
+                double palpAngle = 0.05 * pedipalpSwayFactor * std::sin(tNormalized * 2.0 * Math::Pi * 1.0 + 1.0);
                 computeBone("RightPedipalp", palpAngle, palpAngle * 0.3);
             }
 
             // Legs: use IK to keep feet grounded with subtle twitching
             for (size_t i = 0; i < legCount; ++i) {
-                double legPhase = tNormalized * 2.0 * Math::Pi * 0.3 + legs[i].phaseOffset * Math::Pi;
+                double legPhase = tNormalized * 2.0 * Math::Pi * 1.0 + legs[i].phaseOffset * Math::Pi;
                 double twitch = 0.006 * legTwitchFactor * std::sin(legPhase);
 
                 // Foot stays on ground; only add tiny lateral twitch

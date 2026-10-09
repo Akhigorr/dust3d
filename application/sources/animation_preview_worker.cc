@@ -2,6 +2,7 @@
 #include "theme.h"
 #include <QDebug>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <dust3d/animation/sound_event_detector.h>
 #include <dust3d/animation/sound_generator.h>
@@ -35,6 +36,8 @@ void AnimationPreviewWorker::process()
     m_movementDirectionX = animationClip.movementDirectionX;
     m_movementDirectionZ = animationClip.movementDirectionZ;
     m_durationSeconds = animationClip.durationSeconds;
+    if (animationClip.frames.size() > 1)
+        m_frameInterval = animationClip.frames[1].time - animationClip.frames[0].time;
 
     // Generate procedural sound from animation contact events
     m_soundData = dust3d::AnimationSoundData();
@@ -48,6 +51,9 @@ void AnimationPreviewWorker::process()
 
     // Generate a mesh for every frame
     for (const auto& frame : animationClip.frames) {
+        // The terminal loop key is required by exporters but duplicates frame zero.
+        if (animationClip.loop && frame.time >= animationClip.durationSeconds)
+            continue;
         RigStructure poseRig = m_rigStructure;
 
         for (auto& boneNode : poseRig.bones) {
@@ -105,38 +111,47 @@ void AnimationPreviewWorker::process()
         ModelMesh skeletonMesh(vertices, faces, triangleVertexNormals,
             dust3d::Color(Theme::green.redF(), Theme::green.greenF(), Theme::green.blueF()),
             0.0f, 1.0f, vertexProperties);
+        // No UV for the bones: they keep their own color when the model is textured
+        for (int i = 0; i < skeletonMesh.triangleVertexCount(); ++i) {
+            skeletonMesh.triangleVertices()[i].texU = -1.0f;
+            skeletonMesh.triangleVertices()[i].texV = -1.0f;
+        }
 
         std::unique_ptr<ModelMesh> frameMesh;
         if (m_rigObject && !m_rigObject->vertices.empty() && !frame.boneSkinMatrices.empty()) {
             dust3d::Object skinnedObject(*m_rigObject);
 
+            // The bones of every vertex, resolved to the skin matrices of this frame
+            using VertexSkin = std::array<std::pair<const dust3d::Matrix4x4*, float>, 4>;
+            const std::array<const std::vector<std::pair<std::string, float>>*, 4> vertexBones = {
+                &m_rigObject->vertexBone1, &m_rigObject->vertexBone2,
+                &m_rigObject->vertexBone3, &m_rigObject->vertexBone4
+            };
+            std::vector<VertexSkin> vertexSkins(skinnedObject.vertices.size());
+            for (size_t i = 0; i < vertexSkins.size(); ++i) {
+                for (size_t k = 0; k < vertexBones.size(); ++k) {
+                    vertexSkins[i][k] = { nullptr, 0.0f };
+                    if (i >= vertexBones[k]->size())
+                        continue;
+                    const auto& bone = (*vertexBones[k])[i];
+                    if (bone.first.empty())
+                        continue;
+                    auto it = frame.boneSkinMatrices.find(bone.first);
+                    if (it != frame.boneSkinMatrices.end())
+                        vertexSkins[i][k] = { &it->second, bone.second };
+                }
+            }
+
             for (size_t i = 0; i < skinnedObject.vertices.size(); ++i) {
                 const dust3d::Vector3& origin = m_rigObject->vertices[i];
                 dust3d::Vector3 transformed(0.0f, 0.0f, 0.0f);
                 float totalWeight = 0.0f;
-
-                if (i < m_rigObject->vertexBone1.size()) {
-                    const auto& b1 = m_rigObject->vertexBone1[i];
-                    if (!b1.first.empty()) {
-                        auto it = frame.boneSkinMatrices.find(b1.first);
-                        if (it != frame.boneSkinMatrices.end()) {
-                            transformed += it->second.transformPoint(origin) * b1.second;
-                            totalWeight += b1.second;
-                        }
-                    }
+                for (const auto& skin : vertexSkins[i]) {
+                    if (nullptr == skin.first)
+                        continue;
+                    transformed += skin.first->transformPoint(origin) * skin.second;
+                    totalWeight += skin.second;
                 }
-
-                if (i < m_rigObject->vertexBone2.size()) {
-                    const auto& b2 = m_rigObject->vertexBone2[i];
-                    if (!b2.first.empty()) {
-                        auto it = frame.boneSkinMatrices.find(b2.first);
-                        if (it != frame.boneSkinMatrices.end()) {
-                            transformed += it->second.transformPoint(origin) * b2.second;
-                            totalWeight += b2.second;
-                        }
-                    }
-                }
-
                 if (totalWeight > 1e-6f) {
                     transformed /= totalWeight;
                     skinnedObject.vertices[i] = transformed;
@@ -146,6 +161,37 @@ void AnimationPreviewWorker::process()
             }
 
             frameMesh = std::make_unique<ModelMesh>(skinnedObject);
+
+            // Normals and tangents follow the bones as well, as they do in the exported model,
+            // otherwise the lighting and the normal map stay those of the rest pose.
+            // The length is kept: it carries the handedness of the tangent.
+            auto skinDirection = [&](size_t vertexIndex, float& x, float& y, float& z) {
+                dust3d::Vector3 direction(x, y, z);
+                double length = direction.length();
+                if (length < 1e-6)
+                    return;
+                dust3d::Vector3 transformed(0.0f, 0.0f, 0.0f);
+                for (const auto& skin : vertexSkins[vertexIndex]) {
+                    if (nullptr != skin.first)
+                        transformed += skin.first->transformVector(direction) * skin.second;
+                }
+                double transformedLength = transformed.length();
+                if (transformedLength < 1e-6)
+                    return;
+                transformed *= length / transformedLength;
+                x = (float)transformed.x();
+                y = (float)transformed.y();
+                z = (float)transformed.z();
+            };
+            ModelOpenGLVertex* skinnedVertices = frameMesh->triangleVertices();
+            for (size_t i = 0; i < skinnedObject.triangles.size(); ++i) {
+                for (size_t j = 0; j < 3; ++j) {
+                    ModelOpenGLVertex& v = skinnedVertices[i * 3 + j];
+                    size_t vertexIndex = skinnedObject.triangles[i][j];
+                    skinDirection(vertexIndex, v.normX, v.normY, v.normZ);
+                    skinDirection(vertexIndex, v.tangentX, v.tangentY, v.tangentZ);
+                }
+            }
         }
 
         // Decide what should be visible according to the hide options.
@@ -157,6 +203,7 @@ void AnimationPreviewWorker::process()
             continue;
         }
 
+        m_frameTimes.push_back(frame.time);
         if (showSkeleton && showSkinned) {
             int skeletonCount = skeletonMesh.triangleVertexCount();
             int skinnedCount = frameMesh->triangleVertexCount();
@@ -208,6 +255,10 @@ void AnimationPreviewWorker::process()
                 weight += m_rigObject->vertexBone1[i].second;
             if (i < m_rigObject->vertexBone2.size() && m_rigObject->vertexBone2[i].first == selectedBoneStd)
                 weight += m_rigObject->vertexBone2[i].second;
+            if (i < m_rigObject->vertexBone3.size() && m_rigObject->vertexBone3[i].first == selectedBoneStd)
+                weight += m_rigObject->vertexBone3[i].second;
+            if (i < m_rigObject->vertexBone4.size() && m_rigObject->vertexBone4[i].first == selectedBoneStd)
+                weight += m_rigObject->vertexBone4[i].second;
             vertexWeightColors[i] = calculateBoneWeightColor(weight);
         }
         for (auto& frame : m_previewMeshes) {

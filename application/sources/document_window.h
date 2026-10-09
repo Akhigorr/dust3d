@@ -1,6 +1,7 @@
 #ifndef DUST3D_APPLICATION_DOCUMENT_WINDOW_H_
 #define DUST3D_APPLICATION_DOCUMENT_WINDOW_H_
 
+#include "background_task_group.h"
 #include "component_preview_images_decorator.h"
 #include "graphics_container_widget.h"
 #include "mesh_preview_images_generator.h"
@@ -50,7 +51,7 @@ public:
     BoneManageWidget* boneManageWidget();
     AnimationManageWidget* animationManageWidget();
     bool isWorking();
-    static DocumentWindow* createDocumentWindow();
+    static DocumentWindow* createDocumentWindow(bool visible = true);
     static const std::map<DocumentWindow*, dust3d::Uuid>& documentWindows();
     static void showAcknowlegements();
     static void showContributors();
@@ -102,8 +103,8 @@ public slots:
     void setExportWaitingList(const QStringList& filenames);
     void checkExportWaitingList();
     void exportObjToFilename(const QString& filename);
-    void exportFbxToFilename(const QString& filename);
-    void exportGlbToFilename(const QString& filename, std::function<void()> onFinished = nullptr);
+    void exportFbxToFilename(const QString& filename, std::function<void(bool)> onFinished = nullptr);
+    void exportGlbToFilename(const QString& filename, std::function<void(bool)> onFinished = nullptr);
     void exportModelAndWavs(const QString& directory, const QString& format);
     void toggleRotation();
     void generateComponentPreviewImages();
@@ -124,6 +125,7 @@ public slots:
     void showKeyboardShortcuts();
 
 private:
+    BackgroundTaskGroup m_backgroundTasks;
     void setCurrentFilename(const QString& filename);
     void updateTitle();
     void initializeShortcuts();
@@ -213,6 +215,8 @@ private:
     QMetaObject::Connection m_partListDockerVisibleSwitchConnection;
 
     MeshPreviewImagesGenerator* m_componentPreviewImagesGenerator = nullptr;
+    // Batch export (no window shown): skip work that only feeds the on-screen UI.
+    bool m_headless = false;
     bool m_isComponentPreviewImagesObsolete = false;
 
     std::unique_ptr<ComponentPreviewImagesDecorator> m_componentPreviewImagesDecorator;

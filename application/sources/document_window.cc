@@ -933,10 +933,17 @@ void DocumentWindow::toggleRotation()
     m_canvasGraphicsWidget->setRotated(!m_canvasGraphicsWidget->rotated());
 }
 
-DocumentWindow* DocumentWindow::createDocumentWindow()
+DocumentWindow* DocumentWindow::createDocumentWindow(bool visible)
 {
     DocumentWindow* documentWindow = new DocumentWindow();
     documentWindow->setAttribute(Qt::WA_DeleteOnClose);
+
+    // Batch export (command line -o) never needs an on-screen window. Keeping it hidden
+    // avoids creating GL surfaces, which crashes on headless platforms (QT_QPA_PLATFORM=offscreen).
+    if (!visible) {
+        documentWindow->m_headless = true;
+        return documentWindow;
+    }
 
     QSize size = Preferences::instance().documentWindowSize();
     if (size.isValid()) {
@@ -1161,6 +1168,10 @@ void DocumentWindow::seeSupporters()
 
 DocumentWindow::~DocumentWindow()
 {
+    m_backgroundTasks.waitForDone();
+    delete m_componentPreviewImagesGenerator;
+    m_componentPreviewImagesGenerator = nullptr;
+    m_componentPreviewImagesDecorator.reset();
     qApp->removeEventFilter(this);
     emit uninialized();
     g_documentWindows.erase(this);
@@ -1671,10 +1682,16 @@ void DocumentWindow::exportFbxResult()
     exportFbxToFilename(filename);
 }
 
-void DocumentWindow::exportFbxToFilename(const QString& filename)
+void DocumentWindow::exportFbxToFilename(const QString& filename, std::function<void(bool)> onFinished)
 {
+    auto finished = [onFinished](bool written) {
+        if (onFinished)
+            onFinished(written);
+    };
     if (!m_document->isExportReady()) {
         qDebug() << "Export but document is not export ready";
+        if (onFinished)
+            onFinished(false);
         return;
     }
 
@@ -1688,8 +1705,9 @@ void DocumentWindow::exportFbxToFilename(const QString& filename)
             m_document->textureMetalnessImage.get(),
             m_document->textureRoughnessImage.get(),
             m_document->textureAmbientOcclusionImage.get());
-        fbxFileWriter.save();
+        bool written = fbxFileWriter.save();
         QApplication::restoreOverrideCursor();
+        finished(written);
         return;
     }
 
@@ -1697,7 +1715,10 @@ void DocumentWindow::exportFbxToFilename(const QString& filename)
     const dust3d::Object* rigObject = m_document->currentRigObject();
     const dust3d::Object& uvObject = m_document->currentUvMappedObject();
     if (rigObject->meshId != uvObject.meshId) {
-        QMessageBox::warning(this, tr("Export"), tr("Rig generation is still in progress. Please wait and try again."));
+        if (!m_headless)
+            QMessageBox::warning(this, tr("Export"), tr("Rig generation is still in progress. Please wait and try again."));
+        if (onFinished)
+            onFinished(false);
         return;
     }
 
@@ -1719,6 +1740,13 @@ void DocumentWindow::exportFbxToFilename(const QString& filename)
         ExportAnimationWorker worker;
         worker.setParameters(m_document->getActualRigStructure(), animations);
         worker.process();
+        if (!worker.isSuccessful()) {
+            QApplication::restoreOverrideCursor();
+            if (!m_headless)
+                QMessageBox::warning(this, tr("Export"), tr("Failed to generate the animations. Nothing was exported."));
+            finished(false);
+            return;
+        }
         dust3d::Object rigWithUv = *rigObject;
         rigWithUv.copyUvFrom(uvObject);
         FbxFileWriter fbxFileWriter(rigWithUv, filename,
@@ -1730,58 +1758,65 @@ void DocumentWindow::exportFbxToFilename(const QString& filename)
             &m_document->getActualRigStructure(),
             &worker.inverseBindMatrices(),
             nullptr);
-        fbxFileWriter.save();
+        bool written = fbxFileWriter.save();
         QApplication::restoreOverrideCursor();
+        finished(written);
         return;
     }
 
     // Rig + animations: background thread with progress dialog
     ExportProgressWidget* progressWidget = new ExportProgressWidget(this);
-    progressWidget->show();
+    if (!m_headless)
+        progressWidget->show();
     progressWidget->setStep(tr("Generating animations..."));
 
     ExportAnimationWorker* worker = new ExportAnimationWorker;
     worker->setParameters(m_document->getActualRigStructure(), animations);
 
     QThread* thread = new QThread;
+    m_backgroundTasks.add(thread, worker);
     worker->moveToThread(thread);
 
     RigStructure rigStructure = m_document->getActualRigStructure();
     dust3d::Object rigObjectCopy = *rigObject;
     rigObjectCopy.copyUvFrom(uvObject);
-    QImage* textureImage = m_document->textureImage.get() ? new QImage(*m_document->textureImage.get()) : nullptr;
-    QImage* normalImage = m_document->textureNormalImage.get() ? new QImage(*m_document->textureNormalImage.get()) : nullptr;
-    QImage* metalnessImage = m_document->textureMetalnessImage.get() ? new QImage(*m_document->textureMetalnessImage.get()) : nullptr;
-    QImage* roughnessImage = m_document->textureRoughnessImage.get() ? new QImage(*m_document->textureRoughnessImage.get()) : nullptr;
-    QImage* aoImage = m_document->textureAmbientOcclusionImage.get() ? new QImage(*m_document->textureAmbientOcclusionImage.get()) : nullptr;
+    auto textureImage = m_document->textureImage ? std::make_shared<QImage>(*m_document->textureImage) : nullptr;
+    auto normalImage = m_document->textureNormalImage ? std::make_shared<QImage>(*m_document->textureNormalImage) : nullptr;
+    auto metalnessImage = m_document->textureMetalnessImage ? std::make_shared<QImage>(*m_document->textureMetalnessImage) : nullptr;
+    auto roughnessImage = m_document->textureRoughnessImage ? std::make_shared<QImage>(*m_document->textureRoughnessImage) : nullptr;
+    auto aoImage = m_document->textureAmbientOcclusionImage ? std::make_shared<QImage>(*m_document->textureAmbientOcclusionImage) : nullptr;
 
     connect(thread, &QThread::started, worker, &ExportAnimationWorker::process);
     connect(worker, &ExportAnimationWorker::progress, this, [progressWidget](int current, int total) {
         progressWidget->updateProgress(tr("Generating animations..."), current, total);
     });
-    connect(worker, &ExportAnimationWorker::finished, this, [=]() mutable {
+    connect(worker, &ExportAnimationWorker::finished, thread, &QThread::quit, Qt::DirectConnection);
+    connect(thread, &QThread::finished, this, [=]() mutable {
         progressWidget->setStep(tr("Writing file..."));
-        QApplication::processEvents();
 
+        if (!worker->isSuccessful()) {
+            progressWidget->close();
+            progressWidget->deleteLater();
+            delete worker;
+            if (!m_headless)
+                QMessageBox::warning(this, tr("Export"), tr("Failed to generate the animations. Nothing was exported."));
+            finished(false);
+            return;
+        }
         auto clips = worker->takeAnimationClips();
         const auto& ibm = worker->inverseBindMatrices();
 
         FbxFileWriter fbxFileWriter(rigObjectCopy, filename,
-            textureImage, normalImage, metalnessImage, roughnessImage, aoImage,
+            textureImage.get(), normalImage.get(), metalnessImage.get(), roughnessImage.get(), aoImage.get(),
             &rigStructure,
             &ibm,
             &clips);
-        fbxFileWriter.save();
+        bool written = fbxFileWriter.save();
 
-        delete textureImage;
-        delete normalImage;
-        delete metalnessImage;
-        delete roughnessImage;
-        delete aoImage;
         progressWidget->close();
         progressWidget->deleteLater();
-        worker->deleteLater();
-        thread->quit();
+        delete worker;
+        finished(written);
     });
     connect(thread, &QThread::finished, thread, &QThread::deleteLater);
 
@@ -1817,12 +1852,12 @@ void DocumentWindow::exportGlbResult()
 #endif
 }
 
-void DocumentWindow::exportGlbToFilename(const QString& filename, std::function<void()> onFinished)
+void DocumentWindow::exportGlbToFilename(const QString& filename, std::function<void(bool)> onFinished)
 {
     if (!m_document->isExportReady()) {
         qDebug() << "Export but document is not export ready";
         if (onFinished)
-            onFinished();
+            onFinished(false);
         return;
     }
 
@@ -1836,12 +1871,13 @@ void DocumentWindow::exportGlbToFilename(const QString& filename, std::function<
         QApplication::setOverrideCursor(Qt::WaitCursor);
         dust3d::Object uvObject = m_document->currentUvMappedObject();
         GlbFileWriter glbFileWriter(uvObject, filename,
-            m_document->textureImage.get(), m_document->textureNormalImage.get(), ormImage);
-        glbFileWriter.save();
+            m_document->textureImage.get(), m_document->textureNormalImage.get(), ormImage,
+            nullptr, nullptr, nullptr, m_document->textureEmissiveImage.get());
+        bool written = glbFileWriter.save();
         delete ormImage;
         QApplication::restoreOverrideCursor();
         if (onFinished)
-            onFinished();
+            onFinished(written);
         return;
     }
 
@@ -1849,10 +1885,11 @@ void DocumentWindow::exportGlbToFilename(const QString& filename, std::function<
     const dust3d::Object* rigObject = m_document->currentRigObject();
     const dust3d::Object& uvObject = m_document->currentUvMappedObject();
     if (rigObject->meshId != uvObject.meshId) {
-        QMessageBox::warning(this, tr("Export"), tr("Rig generation is still in progress. Please wait and try again."));
+        if (!m_headless)
+            QMessageBox::warning(this, tr("Export"), tr("Rig generation is still in progress. Please wait and try again."));
         delete ormImage;
         if (onFinished)
-            onFinished();
+            onFinished(false);
         return;
     }
 
@@ -1874,66 +1911,85 @@ void DocumentWindow::exportGlbToFilename(const QString& filename, std::function<
         ExportAnimationWorker worker;
         worker.setParameters(m_document->getActualRigStructure(), animations);
         worker.process();
+        if (!worker.isSuccessful()) {
+            delete ormImage;
+            QApplication::restoreOverrideCursor();
+            if (!m_headless)
+                QMessageBox::warning(this, tr("Export"), tr("Failed to generate the animations. Nothing was exported."));
+            if (onFinished)
+                onFinished(false);
+            return;
+        }
         dust3d::Object rigWithUv = *rigObject;
         rigWithUv.copyUvFrom(uvObject);
         GlbFileWriter glbFileWriter(rigWithUv, filename,
             m_document->textureImage.get(), m_document->textureNormalImage.get(), ormImage,
             &m_document->getActualRigStructure(),
             &worker.inverseBindMatrices(),
-            nullptr);
-        glbFileWriter.save();
+            nullptr, m_document->textureEmissiveImage.get());
+        bool written = glbFileWriter.save();
         delete ormImage;
         QApplication::restoreOverrideCursor();
         if (onFinished)
-            onFinished();
+            onFinished(written);
         return;
     }
 
+    auto ownedOrmImage = std::shared_ptr<QImage>(ormImage);
     // Rig + animations: run worker in background thread with progress dialog
     ExportProgressWidget* progressWidget = new ExportProgressWidget(this);
-    progressWidget->show();
+    if (!m_headless)
+        progressWidget->show();
     progressWidget->setStep(tr("Generating animations..."));
 
     ExportAnimationWorker* worker = new ExportAnimationWorker;
     worker->setParameters(m_document->getActualRigStructure(), animations);
 
     QThread* thread = new QThread;
+    m_backgroundTasks.add(thread, worker);
     worker->moveToThread(thread);
 
     // Capture data needed after thread finishes
     RigStructure rigStructure = m_document->getActualRigStructure();
     dust3d::Object rigObjectCopy = *rigObject;
     rigObjectCopy.copyUvFrom(uvObject);
-    QImage* textureImage = m_document->textureImage.get() ? new QImage(*m_document->textureImage.get()) : nullptr;
-    QImage* normalImage = m_document->textureNormalImage.get() ? new QImage(*m_document->textureNormalImage.get()) : nullptr;
+    auto textureImage = m_document->textureImage ? std::make_shared<QImage>(*m_document->textureImage) : nullptr;
+    auto normalImage = m_document->textureNormalImage ? std::make_shared<QImage>(*m_document->textureNormalImage) : nullptr;
+    auto emissiveImage = m_document->textureEmissiveImage ? std::make_shared<QImage>(*m_document->textureEmissiveImage) : nullptr;
 
     connect(thread, &QThread::started, worker, &ExportAnimationWorker::process);
     connect(worker, &ExportAnimationWorker::progress, this, [progressWidget](int current, int total) {
         progressWidget->updateProgress(tr("Generating animations..."), current, total);
     });
-    connect(worker, &ExportAnimationWorker::finished, this, [=]() mutable {
+    connect(worker, &ExportAnimationWorker::finished, thread, &QThread::quit, Qt::DirectConnection);
+    connect(thread, &QThread::finished, this, [=]() mutable {
         progressWidget->setStep(tr("Writing file..."));
-        QApplication::processEvents();
 
+        if (!worker->isSuccessful()) {
+            progressWidget->close();
+            progressWidget->deleteLater();
+            delete worker;
+            if (!m_headless)
+                QMessageBox::warning(this, tr("Export"), tr("Failed to generate the animations. Nothing was exported."));
+            if (onFinished)
+                onFinished(false);
+            return;
+        }
         auto clips = worker->takeAnimationClips();
         const auto& ibm = worker->inverseBindMatrices();
 
         GlbFileWriter glbFileWriter(rigObjectCopy, filename,
-            textureImage, normalImage, ormImage,
+            textureImage.get(), normalImage.get(), ownedOrmImage.get(),
             &rigStructure,
             &ibm,
-            &clips);
-        glbFileWriter.save();
+            &clips, emissiveImage.get());
+        bool written = glbFileWriter.save();
 
-        delete textureImage;
-        delete normalImage;
-        delete ormImage;
         progressWidget->close();
         progressWidget->deleteLater();
-        worker->deleteLater();
-        thread->quit();
+        delete worker;
         if (onFinished)
-            onFinished();
+            onFinished(written);
     });
     connect(thread, &QThread::finished, thread, &QThread::deleteLater);
 
@@ -2006,15 +2062,16 @@ void DocumentWindow::exportModelAndWavs(const QString& directory, const QString&
     }
 
     // Copy texture images
-    QImage* textureImage = m_document->textureImage.get() ? new QImage(*m_document->textureImage.get()) : nullptr;
-    QImage* normalImage = m_document->textureNormalImage.get() ? new QImage(*m_document->textureNormalImage.get()) : nullptr;
-    QImage* metalnessImage = m_document->textureMetalnessImage.get() ? new QImage(*m_document->textureMetalnessImage.get()) : nullptr;
-    QImage* roughnessImage = m_document->textureRoughnessImage.get() ? new QImage(*m_document->textureRoughnessImage.get()) : nullptr;
-    QImage* aoImage = m_document->textureAmbientOcclusionImage.get() ? new QImage(*m_document->textureAmbientOcclusionImage.get()) : nullptr;
-    QImage* ormImage = UvMapGenerator::combineMetalnessRoughnessAmbientOcclusionImages(
+    auto textureImage = m_document->textureImage ? std::make_shared<QImage>(*m_document->textureImage) : nullptr;
+    auto normalImage = m_document->textureNormalImage ? std::make_shared<QImage>(*m_document->textureNormalImage) : nullptr;
+    auto metalnessImage = m_document->textureMetalnessImage ? std::make_shared<QImage>(*m_document->textureMetalnessImage) : nullptr;
+    auto roughnessImage = m_document->textureRoughnessImage ? std::make_shared<QImage>(*m_document->textureRoughnessImage) : nullptr;
+    auto aoImage = m_document->textureAmbientOcclusionImage ? std::make_shared<QImage>(*m_document->textureAmbientOcclusionImage) : nullptr;
+    auto emissiveImage = m_document->textureEmissiveImage ? std::make_shared<QImage>(*m_document->textureEmissiveImage) : nullptr;
+    auto ormImage = std::shared_ptr<QImage>(UvMapGenerator::combineMetalnessRoughnessAmbientOcclusionImages(
         m_document->textureMetalnessImage.get(),
         m_document->textureRoughnessImage.get(),
-        m_document->textureAmbientOcclusionImage.get());
+        m_document->textureAmbientOcclusionImage.get()));
 
     // Show progress dialog
     ExportProgressWidget* progressWidget = new ExportProgressWidget(this);
@@ -2026,6 +2083,7 @@ void DocumentWindow::exportModelAndWavs(const QString& directory, const QString&
     worker->setParameters(rigStructure, animations);
 
     QThread* thread = new QThread;
+    m_backgroundTasks.add(thread, worker);
     worker->moveToThread(thread);
 
     // Capture animation type/name info for WAV generation
@@ -2042,9 +2100,9 @@ void DocumentWindow::exportModelAndWavs(const QString& directory, const QString&
     connect(worker, &ExportAnimationWorker::progress, this, [progressWidget](int current, int total) {
         progressWidget->updateProgress(tr("Generating animations..."), current, total);
     });
-    connect(worker, &ExportAnimationWorker::finished, this, [=]() mutable {
+    connect(worker, &ExportAnimationWorker::finished, thread, &QThread::quit, Qt::DirectConnection);
+    connect(thread, &QThread::finished, this, [=]() mutable {
         progressWidget->setStep(tr("Writing model and WAV files..."));
-        QApplication::processEvents();
 
         auto clips = worker->takeAnimationClips();
         const auto& ibm = worker->inverseBindMatrices();
@@ -2053,33 +2111,33 @@ void DocumentWindow::exportModelAndWavs(const QString& directory, const QString&
         if (format == "glb") {
             if (hasRig && !clips.empty()) {
                 GlbFileWriter glbFileWriter(rigObjectCopy, modelPath,
-                    textureImage, normalImage, ormImage,
-                    &rigStructure, &ibm, &clips);
+                    textureImage.get(), normalImage.get(), ormImage.get(),
+                    &rigStructure, &ibm, &clips, emissiveImage.get());
                 glbFileWriter.save();
             } else if (hasRig) {
                 GlbFileWriter glbFileWriter(rigObjectCopy, modelPath,
-                    textureImage, normalImage, ormImage,
-                    &rigStructure, &ibm, nullptr);
+                    textureImage.get(), normalImage.get(), ormImage.get(),
+                    &rigStructure, &ibm, nullptr, emissiveImage.get());
                 glbFileWriter.save();
             } else {
                 GlbFileWriter glbFileWriter(uvObject, modelPath,
-                    textureImage, normalImage, ormImage);
+                    textureImage.get(), normalImage.get(), ormImage.get(), nullptr, nullptr, nullptr, emissiveImage.get());
                 glbFileWriter.save();
             }
         } else {
             if (hasRig && !clips.empty()) {
                 FbxFileWriter fbxFileWriter(rigObjectCopy, modelPath,
-                    textureImage, normalImage, metalnessImage, roughnessImage, aoImage,
+                    textureImage.get(), normalImage.get(), metalnessImage.get(), roughnessImage.get(), aoImage.get(),
                     &rigStructure, &ibm, &clips);
                 fbxFileWriter.save();
             } else if (hasRig) {
                 FbxFileWriter fbxFileWriter(rigObjectCopy, modelPath,
-                    textureImage, normalImage, metalnessImage, roughnessImage, aoImage,
+                    textureImage.get(), normalImage.get(), metalnessImage.get(), roughnessImage.get(), aoImage.get(),
                     &rigStructure, &ibm, nullptr);
                 fbxFileWriter.save();
             } else {
                 FbxFileWriter fbxFileWriter(uvObject, modelPath,
-                    textureImage, normalImage, metalnessImage, roughnessImage, aoImage);
+                    textureImage.get(), normalImage.get(), metalnessImage.get(), roughnessImage.get(), aoImage.get());
                 fbxFileWriter.save();
             }
         }
@@ -2099,6 +2157,7 @@ void DocumentWindow::exportModelAndWavs(const QString& directory, const QString&
         // Run WAV generation in another thread
         QThread* wavThread = new QThread;
         auto wavWorker = new QObject;
+        m_backgroundTasks.add(wavThread, wavWorker);
         wavWorker->moveToThread(wavThread);
 
         connect(wavThread, &QThread::started, wavWorker, [=]() {
@@ -2134,25 +2193,18 @@ void DocumentWindow::exportModelAndWavs(const QString& directory, const QString&
                 }
             }
 
-            QMetaObject::invokeMethod(wavWorker, "deleteLater");
+            wavThread->quit();
         });
-        connect(wavWorker, &QObject::destroyed, this, [=]() {
-            delete textureImage;
-            delete normalImage;
-            delete metalnessImage;
-            delete roughnessImage;
-            delete aoImage;
-            delete ormImage;
+        connect(wavThread, &QThread::finished, this, [=]() {
+            delete wavWorker;
             progressWidget->close();
             progressWidget->deleteLater();
-            wavThread->quit();
         });
         connect(wavThread, &QThread::finished, wavThread, &QThread::deleteLater);
 
         wavThread->start();
 
-        worker->deleteLater();
-        thread->quit();
+        delete worker;
     });
     connect(thread, &QThread::finished, thread, &QThread::deleteLater);
 
@@ -2215,16 +2267,20 @@ void DocumentWindow::checkExportWaitingList()
     m_waitingForExportToFilenames.clear();
 
     bool isSuccessful = m_document->isMeshGenerationSucceed();
+    // An empty result (e.g. a document that failed to load) is not a successful mesh export.
+    if (m_document->currentUvMappedObject().triangles.empty())
+        isSuccessful = false;
     for (const auto& filename : list) {
         if (filename.endsWith(".obj")) {
             exportObjToFilename(filename);
             emit waitingExportFinished(filename, isSuccessful);
         } else if (filename.endsWith(".fbx")) {
-            exportFbxToFilename(filename);
-            emit waitingExportFinished(filename, isSuccessful);
+            exportFbxToFilename(filename, [this, filename, isSuccessful](bool written) {
+                emit waitingExportFinished(filename, isSuccessful && written);
+            });
         } else if (filename.endsWith(".glb")) {
-            exportGlbToFilename(filename, [this, filename, isSuccessful]() {
-                emit waitingExportFinished(filename, isSuccessful);
+            exportGlbToFilename(filename, [this, filename, isSuccessful](bool written) {
+                emit waitingExportFinished(filename, isSuccessful && written);
             });
         } else if (filename.endsWith(".ds3")) {
             saveTo(filename);
@@ -2237,6 +2293,11 @@ void DocumentWindow::checkExportWaitingList()
 
 void DocumentWindow::generateComponentPreviewImages()
 {
+    // The part list thumbnails are only for the window. A headless export quitting while
+    // they render on their own GL thread crashes, so they are not made at all.
+    if (m_headless)
+        return;
+
     if (nullptr != m_componentPreviewImagesGenerator) {
         m_isComponentPreviewImagesObsolete = true;
         return;
@@ -2284,16 +2345,17 @@ void DocumentWindow::generateComponentPreviewImages()
 
     if (useThreadedOpenGL) {
         QThread* thread = new QThread;
+        m_backgroundTasks.add(thread);
         m_componentPreviewImagesGenerator->moveToThread(thread);
         connect(thread, &QThread::started, m_componentPreviewImagesGenerator, &MeshPreviewImagesGenerator::process);
-        connect(m_componentPreviewImagesGenerator, &MeshPreviewImagesGenerator::finished, this, &DocumentWindow::componentPreviewImagesReady);
-        connect(m_componentPreviewImagesGenerator, &MeshPreviewImagesGenerator::finished, thread, &QThread::quit);
+        connect(thread, &QThread::finished, this, &DocumentWindow::componentPreviewImagesReady);
+        connect(m_componentPreviewImagesGenerator, &MeshPreviewImagesGenerator::finished, thread, &QThread::quit, Qt::DirectConnection);
         connect(thread, &QThread::finished, thread, &QThread::deleteLater);
         thread->start();
     } else {
         QTimer::singleShot(10, this, [this]() {
-            connect(m_componentPreviewImagesGenerator, &MeshPreviewImagesGenerator::finished, this, &DocumentWindow::componentPreviewImagesReady);
             m_componentPreviewImagesGenerator->process();
+            componentPreviewImagesReady();
         });
     }
 }
@@ -2329,6 +2391,7 @@ void DocumentWindow::decorateComponentPreviewImages()
     m_isComponentPreviewImageDecorationsObsolete = false;
 
     QThread* thread = new QThread;
+    m_backgroundTasks.add(thread);
 
     auto previewInputs = std::make_unique<std::vector<ComponentPreviewImagesDecorator::PreviewInput>>();
 
@@ -2351,8 +2414,8 @@ void DocumentWindow::decorateComponentPreviewImages()
     m_componentPreviewImagesDecorator = std::make_unique<ComponentPreviewImagesDecorator>(std::move(previewInputs));
     m_componentPreviewImagesDecorator->moveToThread(thread);
     connect(thread, &QThread::started, m_componentPreviewImagesDecorator.get(), &ComponentPreviewImagesDecorator::process);
-    connect(m_componentPreviewImagesDecorator.get(), &ComponentPreviewImagesDecorator::finished, this, &DocumentWindow::componentPreviewImageDecorationsReady);
-    connect(m_componentPreviewImagesDecorator.get(), &ComponentPreviewImagesDecorator::finished, thread, &QThread::quit);
+    connect(thread, &QThread::finished, this, &DocumentWindow::componentPreviewImageDecorationsReady);
+    connect(m_componentPreviewImagesDecorator.get(), &ComponentPreviewImagesDecorator::finished, thread, &QThread::quit, Qt::DirectConnection);
     connect(thread, &QThread::finished, thread, &QThread::deleteLater);
     thread->start();
 

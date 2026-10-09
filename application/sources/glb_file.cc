@@ -9,6 +9,7 @@
 #include <QQuaternion>
 #include <QtCore/qbuffer.h>
 #include <cmath>
+#include <dust3d/base/position_key.h>
 
 bool GlbFileWriter::m_enableComment = false;
 
@@ -19,7 +20,8 @@ GlbFileWriter::GlbFileWriter(dust3d::Object& object,
     QImage* ormImage,
     const RigStructure* rigStructure,
     const std::map<std::string, dust3d::Matrix4x4>* inverseBindMatrices,
-    const std::vector<dust3d::RigAnimationClip>* animationClips)
+    const std::vector<dust3d::RigAnimationClip>* animationClips,
+    QImage* emissiveImage)
     : m_filename(filename)
 {
     const std::vector<std::vector<dust3d::Vector3>>* triangleVertexNormals = object.triangleVertexNormals();
@@ -121,6 +123,7 @@ GlbFileWriter::GlbFileWriter(dust3d::Object& object,
 
     m_json["asset"]["version"] = "2.0";
     m_json["asset"]["generator"] = APP_NAME " " APP_HUMAN_VER;
+    m_json["scene"] = 0;
     m_json["scenes"][0]["nodes"] = { 0 };
 
     if (hasRig) {
@@ -129,6 +132,34 @@ GlbFileWriter::GlbFileWriter(dust3d::Object& object,
         m_json["nodes"][1]["skin"] = 0;
     } else {
         m_json["nodes"][0]["mesh"] = 0;
+    }
+
+    // The component (part) each triangle came from (worked out by the UV map generator),
+    // written as a "_PART" vertex attribute: an index into mesh.extras.dust3dParts, the
+    // components' ids and names. Tools use it to tell parts apart after export: materials
+    // per part, equipment slots, texture baking.
+    const bool outputPartIds = object.triangleComponentIds.size() == object.triangles.size() && !object.triangles.empty();
+    std::vector<float> trianglePartIndices;
+    nlohmann::json partIdList = nlohmann::json::array();
+    if (outputPartIds) {
+        const auto& triangleComponents = object.triangleComponentIds;
+        std::map<dust3d::Uuid, int> partIndexMap;
+        for (const auto& componentId : triangleComponents) {
+            auto found = partIndexMap.find(componentId);
+            int index;
+            if (found == partIndexMap.end()) {
+                index = (int)partIndexMap.size();
+                partIndexMap.insert({ componentId, index });
+                nlohmann::json partInfo;
+                partInfo["id"] = componentId.isNull() ? std::string() : componentId.toString();
+                auto name = object.componentNames.find(componentId);
+                partInfo["name"] = name == object.componentNames.end() ? std::string() : name->second;
+                partIdList.push_back(partInfo);
+            } else {
+                index = found->second;
+            }
+            trianglePartIndices.push_back((float)index);
+        }
     }
 
     std::vector<dust3d::Vector3> triangleVertexPositions;
@@ -155,6 +186,10 @@ GlbFileWriter::GlbFileWriter(dust3d::Object& object,
             m_json["meshes"][0]["primitives"][primitiveIndex]["attributes"]["JOINTS_0"] = bufferViewIndex + (++attributeIndex);
             m_json["meshes"][0]["primitives"][primitiveIndex]["attributes"]["WEIGHTS_0"] = bufferViewIndex + (++attributeIndex);
         }
+        if (outputPartIds) {
+            m_json["meshes"][0]["primitives"][primitiveIndex]["attributes"]["_PART"] = bufferViewIndex + (++attributeIndex);
+            m_json["meshes"][0]["extras"]["dust3dParts"] = partIdList;
+        }
         int textureIndex = 0;
         m_json["materials"][primitiveIndex]["pbrMetallicRoughness"]["baseColorTexture"]["index"] = textureIndex++;
         m_json["materials"][primitiveIndex]["pbrMetallicRoughness"]["metallicFactor"] = ModelMesh::m_defaultMetalness;
@@ -170,6 +205,10 @@ GlbFileWriter::GlbFileWriter(dust3d::Object& object,
             m_json["materials"][primitiveIndex]["pbrMetallicRoughness"]["metallicFactor"] = 1.0;
             m_json["materials"][primitiveIndex]["pbrMetallicRoughness"]["roughnessFactor"] = 1.0;
             textureIndex++;
+        }
+        if (emissiveImage) {
+            m_json["materials"][primitiveIndex]["emissiveTexture"]["index"] = textureIndex++;
+            m_json["materials"][primitiveIndex]["emissiveFactor"] = { 1.0, 1.0, 1.0 };
         }
 
         primitiveIndex++;
@@ -295,18 +334,16 @@ GlbFileWriter::GlbFileWriter(dust3d::Object& object,
             m_json["bufferViews"][bufferViewIndex]["buffer"] = 0;
             m_json["bufferViews"][bufferViewIndex]["byteOffset"] = bufferViewFromOffset;
             for (const auto& oldIndex : triangleVertexOldIndices) {
-                quint16 j0 = 0, j1 = 0;
-                if (oldIndex < object.vertexBone1.size() && !object.vertexBone1[oldIndex].first.empty()) {
-                    auto it = boneNameToIndex.find(object.vertexBone1[oldIndex].first);
-                    if (it != boneNameToIndex.end())
-                        j0 = (quint16)it->second;
+                quint16 joints[4] = { 0, 0, 0, 0 };
+                const std::vector<std::pair<std::string, float>>* boneSlots[4] = { &object.vertexBone1, &object.vertexBone2, &object.vertexBone3, &object.vertexBone4 };
+                for (size_t s = 0; s < 4; ++s) {
+                    if (oldIndex < boneSlots[s]->size() && !(*boneSlots[s])[oldIndex].first.empty()) {
+                        auto it = boneNameToIndex.find((*boneSlots[s])[oldIndex].first);
+                        if (it != boneNameToIndex.end())
+                            joints[s] = (quint16)it->second;
+                    }
                 }
-                if (oldIndex < object.vertexBone2.size() && !object.vertexBone2[oldIndex].first.empty()) {
-                    auto it = boneNameToIndex.find(object.vertexBone2[oldIndex].first);
-                    if (it != boneNameToIndex.end())
-                        j1 = (quint16)it->second;
-                }
-                binStream << j0 << j1 << (quint16)0 << (quint16)0;
+                binStream << joints[0] << joints[1] << joints[2] << joints[3];
             }
             m_json["bufferViews"][bufferViewIndex]["byteLength"] = m_binByteArray.size() - bufferViewFromOffset;
             alignBin();
@@ -323,12 +360,13 @@ GlbFileWriter::GlbFileWriter(dust3d::Object& object,
             m_json["bufferViews"][bufferViewIndex]["buffer"] = 0;
             m_json["bufferViews"][bufferViewIndex]["byteOffset"] = bufferViewFromOffset;
             for (const auto& oldIndex : triangleVertexOldIndices) {
-                float w0 = 0.0f, w1 = 0.0f;
-                if (oldIndex < object.vertexBone1.size() && !object.vertexBone1[oldIndex].first.empty())
-                    w0 = object.vertexBone1[oldIndex].second;
-                if (oldIndex < object.vertexBone2.size() && !object.vertexBone2[oldIndex].first.empty())
-                    w1 = object.vertexBone2[oldIndex].second;
-                binStream << w0 << w1 << (float)0.0f << (float)0.0f;
+                float weights[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                const std::vector<std::pair<std::string, float>>* boneSlots[4] = { &object.vertexBone1, &object.vertexBone2, &object.vertexBone3, &object.vertexBone4 };
+                for (size_t s = 0; s < 4; ++s) {
+                    if (oldIndex < boneSlots[s]->size() && !(*boneSlots[s])[oldIndex].first.empty())
+                        weights[s] = (*boneSlots[s])[oldIndex].second;
+                }
+                binStream << weights[0] << weights[1] << weights[2] << weights[3];
             }
             m_json["bufferViews"][bufferViewIndex]["byteLength"] = m_binByteArray.size() - bufferViewFromOffset;
             alignBin();
@@ -339,6 +377,22 @@ GlbFileWriter::GlbFileWriter(dust3d::Object& object,
             m_json["accessors"][bufferViewIndex]["componentType"] = 5126;
             m_json["accessors"][bufferViewIndex]["count"] = triangleVertexOldIndices.size();
             m_json["accessors"][bufferViewIndex]["type"] = "VEC4";
+            bufferViewIndex++;
+        }
+
+        if (outputPartIds) {
+            bufferViewFromOffset = (int)m_binByteArray.size();
+            m_json["bufferViews"][bufferViewIndex]["buffer"] = 0;
+            m_json["bufferViews"][bufferViewIndex]["byteOffset"] = bufferViewFromOffset;
+            for (const auto& partIndex : trianglePartIndices)
+                binStream << partIndex << partIndex << partIndex;
+            m_json["bufferViews"][bufferViewIndex]["byteLength"] = m_binByteArray.size() - bufferViewFromOffset;
+            alignBin();
+            m_json["accessors"][bufferViewIndex]["bufferView"] = bufferViewIndex;
+            m_json["accessors"][bufferViewIndex]["byteOffset"] = 0;
+            m_json["accessors"][bufferViewIndex]["componentType"] = 5126;
+            m_json["accessors"][bufferViewIndex]["count"] = trianglePartIndices.size() * 3;
+            m_json["accessors"][bufferViewIndex]["type"] = "SCALAR";
             bufferViewIndex++;
         }
     }
@@ -442,6 +496,27 @@ GlbFileWriter::GlbFileWriter(dust3d::Object& object,
         for (int animIdx = 0; animIdx < (int)animationClips->size(); ++animIdx) {
             const auto& clip = (*animationClips)[animIdx];
             m_json["animations"][animIdx]["name"] = clip.name;
+            {
+                auto& metadata = m_json["animations"][animIdx]["extras"]["dust3dClip"];
+                metadata["animationType"] = clip.animationType;
+                metadata["rigType"] = rigStructure->type.toStdString();
+                metadata["durationSeconds"] = clip.durationSeconds;
+                metadata["loop"] = clip.loop;
+                metadata["entryPose"] = clip.entryPose;
+                metadata["exitPose"] = clip.exitPose;
+                metadata["rootYawDegrees"] = clip.rootYawDegrees;
+                metadata["rootMotion"] = clip.rootMotion;
+                metadata["events"] = nlohmann::json::array();
+                for (const auto& event : clip.events) {
+                    nlohmann::json item = { { "name", event.name }, { "time", event.time } };
+                    if (!event.bone.empty())
+                        item["bone"] = event.bone;
+                    metadata["events"].push_back(item);
+                }
+                metadata["keyFrameCount"] = clip.frames.size();
+                metadata["movementSpeed"] = clip.movementSpeed;
+                metadata["movementDirection"] = { clip.movementDirectionX, 0.0f, clip.movementDirectionZ };
+            }
 
             // Input: keyframe timestamps
             int inputAccessorIdx = bufferViewIndex;
@@ -605,6 +680,27 @@ GlbFileWriter::GlbFileWriter(dust3d::Object& object,
         QByteArray pngByteArray;
         QBuffer buffer(&pngByteArray);
         ormImage->save(&buffer, "PNG");
+        binStream.writeRawData(pngByteArray.data(), pngByteArray.size());
+        alignBin();
+        m_json["bufferViews"][bufferViewIndex]["byteLength"] = m_binByteArray.size() - bufferViewFromOffset;
+        m_json["images"][imageIndex]["bufferView"] = bufferViewIndex;
+        m_json["images"][imageIndex]["mimeType"] = "image/png";
+        bufferViewIndex++;
+
+        imageIndex++;
+        textureIndex++;
+    }
+
+    if (nullptr != emissiveImage) {
+        m_json["textures"][textureIndex]["sampler"] = 0;
+        m_json["textures"][textureIndex]["source"] = imageIndex;
+
+        bufferViewFromOffset = (int)m_binByteArray.size();
+        m_json["bufferViews"][bufferViewIndex]["buffer"] = 0;
+        m_json["bufferViews"][bufferViewIndex]["byteOffset"] = bufferViewFromOffset;
+        QByteArray pngByteArray;
+        QBuffer buffer(&pngByteArray);
+        emissiveImage->save(&buffer, "PNG");
         binStream.writeRawData(pngByteArray.data(), pngByteArray.size());
         alignBin();
         m_json["bufferViews"][bufferViewIndex]["byteLength"] = m_binByteArray.size() - bufferViewFromOffset;
